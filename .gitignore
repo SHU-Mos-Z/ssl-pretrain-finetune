@@ -1,0 +1,114 @@
+# =============================================================================
+# DFS3R code repository ignore rules
+#
+# This repository tracks first-party source code, experiment launchers, tests,
+# and small reproducibility metadata. Raw/processed data, checkpoints, training
+# records, generated figures, third-party repositories, and machine-local
+# settings stay outside Git.
+# =============================================================================
+
+# --- Dataset and experiment artifacts (may be hundreds of GB) ----------------
+/data/
+/records/
+/data_vis/
+/seg_label_rgb/
+/LUAD_PUAD_train_nmf_transfer_lex_from_1200/
+
+# --- Third-party or separately managed repositories ---------------------------
+/MIDOGpp/
+/MedSAM/
+/sam2/
+/sam3/
+/unrelated/
+/旧代码/
+
+# --- Generated transfer bundles and duplicated minimal repositories -----------
+/PUAD_segmentation_experiment_minimal_*/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.7z
+*.rar
+
+# --- Model weights and exported models ----------------------------------------
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+
+# --- Common hyperspectral/data payload formats --------------------------------
+*.raw
+*.hdr
+*.mat
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.tif
+*.tiff
+
+# --- Generated reports, plots, and analysis workspaces ------------------------
+*.ipynb
+*.pdf
+/assets/
+/paper-framework/
+/c_sum_hist_*.png
+/endmembers_*.png
+
+# Root-level manuscripts and historical design notes are not required by the
+# Bash execution closure. README.md and docs/ remain tracked.
+/*.md
+!/README.md
+/*.tex
+/*.bib
+
+# --- Runtime logs and experiment-service state --------------------------------
+*.log
+*.out
+*.err
+*.pid
+/wandb/
+/mlruns/
+/lightning_logs/
+/runs/
+
+# --- Python caches, coverage, and build products -------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+build/
+dist/
+*.egg-info/
+
+# --- Virtual environments and machine-local configuration ---------------------
+.venv/
+venv/
+env/
+.conda/
+.env
+.env.*
+!.env.example
+/bind_mount.sh
+/new_user.sh
+
+# --- Editors, agents, and operating-system metadata ---------------------------
+/.vscode/
+/.idea/
+/.codex/
+/.agents/
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo

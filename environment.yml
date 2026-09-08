@@ -1,0 +1,26 @@
+name: zsq_accl_mine
+
+channels:
+  - defaults
+
+dependencies:
+  - python=3.10.20
+  - pip
+  - pip:
+      # CUDA 12.1 wheels matching the environment used for current experiments.
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+      - torch==2.4.1+cu121
+      - torchvision==0.19.1+cu121
+      - torchaudio==2.4.1+cu121
+      - numpy==2.2.6
+      - scipy==1.15.3
+      - scikit-learn==1.7.2
+      - scikit-image==0.25.2
+      - matplotlib==3.10.9
+      - pandas==2.3.3
+      - tqdm==4.70.0
+      - Pillow==12.3.0
+      - opencv-python-headless==5.0.0.93
+      - PyYAML==6.0.3
+      - pycocotools==2.0.11
+      - pytest==9.1.1
