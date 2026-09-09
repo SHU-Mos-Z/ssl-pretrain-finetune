@@ -20,17 +20,11 @@ export VAL_ROOT="${VAL_ROOT:-data/LUAD_PUAD_official224_centerbalanced_3660/val}
 export TEST_ROOT="${TEST_ROOT:-data/LUAD_PUAD_official224_centerbalanced_3660/test}"
 
 EXPERIMENT_SCRIPTS=(
-    "$SCRIPT_DIR/00_p_00_default.sh"
-    "$SCRIPT_DIR/01_p_a1_dihedral.sh"
-    "$SCRIPT_DIR/02_p_a2_dihedral_affine.sh"
-    "$SCRIPT_DIR/03_p_a3_dihedral_perspective.sh"
     "$SCRIPT_DIR/04_p_h1_residual.sh"
     "$SCRIPT_DIR/05_p_h2_aspp.sh"
     "$SCRIPT_DIR/06_p_h3_multiscale_aux.sh"
     "$SCRIPT_DIR/07_p_l1_weighted_ce_dice.sh"
     "$SCRIPT_DIR/08_p_l2_focal_dice.sh"
-    "$SCRIPT_DIR/09_p_l3_weighted_boundary.sh"
-    "$SCRIPT_DIR/10_p_o1_discriminative_lr.sh"
     "$SCRIPT_DIR/11_p_o2_staged_unfreeze.sh"
     "$SCRIPT_DIR/12_p_e1_scene_endmembers.sh"
     "$SCRIPT_DIR/13_p_final_seed42.sh"
