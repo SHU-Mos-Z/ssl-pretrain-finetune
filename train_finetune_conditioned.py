@@ -140,6 +140,27 @@ def get_args():
     )
     p.add_argument("--scene-endmember-root", default=None)
     p.add_argument("--workers", type=int, default=4)
+    p.add_argument(
+        "--persistent-workers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Keep DataLoader workers alive between epochs (effective when workers > 0).",
+    )
+    p.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=2,
+        help="Number of batches prefetched by each DataLoader worker.",
+    )
+    p.add_argument(
+        "--distributed-validation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Evaluate each original validation batch on exactly one DDP rank. "
+            "Original batch boundaries are preserved for metric compatibility."
+        ),
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save-dir", default="records/finetune_conditioned/run")
     p.add_argument("--save-interval", type=int, default=10)
@@ -580,6 +601,13 @@ def main():
             f"primary={primary_dice_metric}",
             flush=True,
         )
+        print(
+            f"[Finetune] DataLoader: workers/rank={a.workers}, "
+            f"persistent={a.persistent_workers and a.workers > 0}, "
+            f"prefetch_factor={a.prefetch_factor if a.workers > 0 else 'n/a'}, "
+            f"distributed_validation={a.distributed_validation}",
+            flush=True,
+        )
         if a.test_root:
             sliding_details = (
                 f", window={a.test_window_size}, stride={a.test_window_stride}, "
@@ -624,6 +652,10 @@ def main():
         a.workers,
         True,
         test_inference_mode=a.test_inference_mode,
+        persistent_workers=a.persistent_workers,
+        prefetch_factor=a.prefetch_factor,
+        distributed_validation=a.distributed_validation,
+        validation_max_batches=a.max_eval_batches,
         **data_kwargs,
     )
     cfg = ConditionedModelConfig(
@@ -805,7 +837,12 @@ def main():
                 nn.utils.clip_grad_norm_(model.parameters(), a.clip_grad)
             optimizer.step()
             scheduler.step()
-            total += torch.tensor([float(loss.detach()), 1], device=local)
+            # Keep epoch-loss accumulation on device.  Converting the loss to a
+            # Python float here forced a GPU-to-CPU synchronization every step;
+            # only interval logging and the epoch summary actually need a host
+            # value.  This does not participate in backward or optimizer state.
+            total[0].add_(loss.detach())
+            total[1].add_(1)
             if (
                 a.progress == "log"
                 and rank == 0

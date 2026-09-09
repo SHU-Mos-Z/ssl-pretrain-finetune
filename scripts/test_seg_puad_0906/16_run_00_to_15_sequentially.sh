@@ -10,6 +10,12 @@ cd "$PROJECT_ROOT"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6,7}"
 export NUM_GPUS="${NUM_GPUS:-2}"
 export BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-8}"
+# Data-pipeline-only controls.  They do not change sample order, augmentation
+# parameters, model inputs, loss, optimizer, or learning-rate schedule.
+export WORKERS="${WORKERS:-2}"
+export PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
+export PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
+export DISTRIBUTED_VALIDATION="${DISTRIBUTED_VALIDATION:-true}"
 # 统一传给全部单项实验。参考设置为 2 GPU × 4/GPU、LR=4e-4；当前默认
 # 2 GPU × 8/GPU 的总 batch 翻倍，因此按线性缩放默认使用 8e-4。
 # 可在执行前覆盖，例如：LR=4e-4 bash 16_run_00_to_15_sequentially.sh
@@ -43,6 +49,10 @@ echo "Project root:           $PROJECT_ROOT"
 echo "CUDA_VISIBLE_DEVICES:   $CUDA_VISIBLE_DEVICES"
 echo "NUM_GPUS:               $NUM_GPUS"
 echo "BATCH_SIZE_PER_GPU:     $BATCH_SIZE_PER_GPU"
+echo "WORKERS_PER_RANK:       $WORKERS"
+echo "PERSISTENT_WORKERS:     $PERSISTENT_WORKERS"
+echo "PREFETCH_FACTOR:        $PREFETCH_FACTOR"
+echo "DISTRIBUTED_VALIDATION: $DISTRIBUTED_VALIDATION"
 echo "LR:                     $LR"
 echo "PRETRAIN_CKPT:          $PRETRAIN_CKPT"
 echo "TRAIN_ROOT:             $TRAIN_ROOT"

@@ -127,9 +127,12 @@ ENDMEMBER_SCOPE="${ENDMEMBER_SCOPE:-patch}"
 SCENE_ENDMEMBER_ROOT="${SCENE_ENDMEMBER_ROOT:-}"
 
 # ── 日志 / 存储 ────────────────────────────────────────────────────────────────
-# WORKERS=1：与 LoTS-Net 稳定运行时的实际配置保持一致，降低 DataLoader 子进程
-# 与其它共享 GPU 机器上的进程争抢资源、进而放大 CUDA/NCCL 不稳定的概率。
-WORKERS=1
+# 默认每个 DDP rank 使用 2 个 worker；可由顺序脚本或命令行安全覆盖。
+# 常驻 worker 与预取仅改善供数速度，不改变样本、增强或训练数学语义。
+WORKERS="${WORKERS:-2}"
+PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
+DISTRIBUTED_VALIDATION="${DISTRIBUTED_VALIDATION:-true}"
 # HD95 计算后端：
 #   scipy  -> CPU 距离变换，训练更稳定（推荐默认）
 #   monai  -> 与 LoTS-Net reference 一致的 MONAI GPU 实现（本机 DDP 下可能不稳定）
@@ -195,6 +198,14 @@ fi
 SCENE_ENDMEMBER_ARG=""
 if [ -n "$SCENE_ENDMEMBER_ROOT" ]; then
     SCENE_ENDMEMBER_ARG="--scene-endmember-root $SCENE_ENDMEMBER_ROOT"
+fi
+PERSISTENT_WORKERS_ARG=""
+if [ "$PERSISTENT_WORKERS" = "true" ]; then
+    PERSISTENT_WORKERS_ARG="--persistent-workers"
+fi
+DISTRIBUTED_VALIDATION_ARG=""
+if [ "$DISTRIBUTED_VALIDATION" = "true" ]; then
+    DISTRIBUTED_VALIDATION_ARG="--distributed-validation"
 fi
 EVAL_ONLY_ARGS=()
 if [ -n "$EVAL_ONLY_CHECKPOINT" ]; then
@@ -276,6 +287,7 @@ OMP_NUM_THREADS=2 torchrun \
     --augmentation-padding-mode "$AUGMENTATION_PADDING_MODE" \
     --endmember-scope        "$ENDMEMBER_SCOPE" \
     --workers                $WORKERS \
+    --prefetch-factor         $PREFETCH_FACTOR \
     --save-interval          $SAVE_INTERVAL \
     --best-val-interval      $BEST_VAL_INTERVAL \
     --progress               $PROGRESS \
@@ -299,5 +311,7 @@ OMP_NUM_THREADS=2 torchrun \
     $FREEZE_ARG \
     $AUGMENT_ARG \
     $SCENE_ENDMEMBER_ARG \
+    $PERSISTENT_WORKERS_ARG \
+    $DISTRIBUTED_VALIDATION_ARG \
     "${EVAL_ONLY_ARGS[@]}" \
     2>&1 | tee "$SAVE_DIR/records.txt"

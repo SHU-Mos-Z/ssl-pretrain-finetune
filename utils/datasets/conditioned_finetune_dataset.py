@@ -5,14 +5,17 @@ import warnings
 from pathlib import Path
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
 from utils.physics.beer_lambert import intensity_to_od_np
 from utils.preprocessing.offline_nmf import cache_dir_name, load_intensity_cube
 from utils.tokenization.band_padding import band_pad_amounts, pad_bands
+from utils.tokenization.patch_tokens import compute_patch_token_raw, grid_sizes
+from utils.tokenization.positional_targets import compute_pe_spatial
 from utils.tokenization.spectral_metadata import load_wavelengths, token_spectral_positions
-from utils.tokenization.token_builder import TokenBuildConfig, build_tokens
+from utils.tokenization.spectral_groups import SpectralGroups
+from utils.tokenization.token_builder import TokenBuildConfig
 from utils.metrics import infer_segmentation_scene_id
 from utils.augmentations.segmentation_spatial import (
     SEGMENTATION_AUGMENTATION_POLICIES,
@@ -66,23 +69,30 @@ def build_conditioned_model_inputs(
         raise ValueError(
             f'conditioned input {(h, w)} must be divisible by patch size {cfg.patch_size}'
         )
-    dummy = np.full((e_star.shape[0], h, w), 1 / e_star.shape[0], np.float32)
-    tokens = build_tokens(od, dummy, cfg)
-    tokens.pe_spectral[:] = token_spectral_positions(
-        wavelengths, tokens.h_p, tokens.w_p, tokens.s_p
+    # Fine-tuning consumes only raw OD tokens and their positions.  The generic
+    # pre-training token builder also constructs dummy abundance positions and
+    # dense abundance targets, neither of which is returned here.  Build only
+    # the model inputs that are actually used, with the same ordering/formulae.
+    n_sp = cfg.num_groups_for(s)
+    groups = SpectralGroups(s, n_sp)
+    h_p, w_p = grid_sizes(h, w, cfg.patch_size)
+    token_raw = compute_patch_token_raw(od, cfg.patch_size, groups)
+    pe_spatial = compute_pe_spatial(h, w, cfg.patch_size, groups)
+    pe_spectral = token_spectral_positions(
+        wavelengths, h_p, w_p, groups.patch_size
     )
-    visible = np.ones((tokens.h_p, tokens.w_p, tokens.n_sp), np.bool_)
+    visible = np.ones((h_p, w_p, n_sp), np.bool_)
     voxel = np.ones((s, h, w), np.bool_)
     return {
         'od': torch.from_numpy(od),
         'intensity': torch.from_numpy(intensity),
         'e_star': torch.from_numpy(e_star),
         'wavelengths': torch.from_numpy(wavelengths),
-        'token_raw': torch.from_numpy(tokens.token_raw),
+        'token_raw': torch.from_numpy(token_raw),
         'token_visible': torch.from_numpy(visible),
         'voxel_visible': torch.from_numpy(voxel),
-        'pe_spatial': torch.from_numpy(tokens.pe_spatial),
-        'pe_spectral': torch.from_numpy(tokens.pe_spectral),
+        'pe_spatial': torch.from_numpy(pe_spatial),
+        'pe_spectral': torch.from_numpy(pe_spectral),
     }
 
 
@@ -356,7 +366,10 @@ class ConditionedFinetuneDataset(Dataset):
         else:
             base_index, copy_index, transform_id = idx, 0, 0
         stem=self.stems[base_index]
-        intensity=load_intensity_cube(self.root/'images'/f'{stem}.npy')
+        cube, channel_first = _open_intensity_memmap(
+            self.root/'images'/f'{stem}.npy'
+        )
+        intensity = cube if channel_first else cube.transpose(2, 0, 1)
         if intensity.shape[0] != self.raw_band_count:
             raise ValueError(
                 f'inconsistent band count for {stem}: {intensity.shape[0]} vs {self.raw_band_count}'
@@ -400,9 +413,59 @@ def _collate(samples):
     return out
 
 
+class DistributedSequentialBatchSampler(Sampler[list[int]]):
+    """Shard complete sequential evaluation batches across DDP ranks.
+
+    Keeping the original batch boundaries is important because the historical
+    ``batch_allclass_macro`` Dice is non-linear within each batch.  A regular
+    sample-level distributed sampler would regroup samples and subtly change
+    that metric.  This sampler assigns each original batch to exactly one rank,
+    so evaluation avoids duplicate work without changing batch composition.
+    """
+
+    def __init__(
+        self, dataset_size: int, batch_size: int, max_batches: int = 0
+    ) -> None:
+        if dataset_size < 0:
+            raise ValueError('dataset_size must be non-negative')
+        if batch_size <= 0:
+            raise ValueError('batch_size must be positive')
+        if max_batches < 0:
+            raise ValueError('max_batches must be non-negative')
+        self.dataset_size = int(dataset_size)
+        self.batch_size = int(batch_size)
+        self.max_batches = int(max_batches)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            self.rank = torch.distributed.get_rank()
+            self.world_size = torch.distributed.get_world_size()
+        else:
+            self.rank = 0
+            self.world_size = 1
+
+    @property
+    def num_global_batches(self) -> int:
+        count = (self.dataset_size + self.batch_size - 1) // self.batch_size
+        return min(count, self.max_batches) if self.max_batches > 0 else count
+
+    def __iter__(self):
+        for batch_index in range(self.rank, self.num_global_batches, self.world_size):
+            start = batch_index * self.batch_size
+            stop = min(start + self.batch_size, self.dataset_size)
+            yield list(range(start, stop))
+
+    def __len__(self) -> int:
+        remaining = self.num_global_batches - self.rank
+        return max(0, (remaining + self.world_size - 1) // self.world_size)
+
+
 def build_conditioned_finetune_loaders(train_root,val_root,test_root,
                                        batch_size=4,num_workers=4,distributed=False,
-                                       test_inference_mode='direct',**kwargs):
+                                       test_inference_mode='direct',
+                                       persistent_workers=False,
+                                       prefetch_factor=2,
+                                       distributed_validation=False,
+                                       validation_max_batches=0,
+                                       **kwargs):
     train=ConditionedFinetuneDataset(train_root,**kwargs)
     evaluation_kwargs = dict(kwargs)
     evaluation_kwargs['augment'] = False
@@ -425,9 +488,32 @@ def build_conditioned_finetune_loaders(train_root,val_root,test_root,
     else:
         test=None
     sampler=DistributedSampler(train,shuffle=True) if distributed else None
-    common=dict(batch_size=batch_size,num_workers=num_workers,pin_memory=True,collate_fn=_collate)
-    train_loader=DataLoader(train,shuffle=sampler is None,sampler=sampler,drop_last=True,**common)
-    val_loader=DataLoader(val,shuffle=False,**common)
+    if num_workers < 0:
+        raise ValueError('num_workers must be non-negative')
+    if prefetch_factor <= 0:
+        raise ValueError('prefetch_factor must be positive')
+    worker_options = dict(
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=bool(persistent_workers and num_workers > 0),
+    )
+    if num_workers > 0:
+        worker_options['prefetch_factor'] = int(prefetch_factor)
+    common=dict(batch_size=batch_size,collate_fn=_collate,**worker_options)
+    train_loader=DataLoader(
+        train,shuffle=sampler is None,sampler=sampler,drop_last=True,**common
+    )
+    if distributed and distributed_validation:
+        val_loader=DataLoader(
+            val,
+            batch_sampler=DistributedSequentialBatchSampler(
+                len(val), batch_size, validation_max_batches
+            ),
+            collate_fn=_collate,
+            **worker_options,
+        )
+    else:
+        val_loader=DataLoader(val,shuffle=False,**common)
     test_loader=(test if isinstance(test,ConditionedSlidingWindowTestDataset)
                  else DataLoader(test,shuffle=False,**common) if test else None)
     return train_loader,val_loader,test_loader,sampler
