@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """基于 NMF 重建误差过滤 + 比例切分，把一个已预处理的数据集拆分为：
 
-  {data_root}_pretrain_p{ratio}_{date}
+  {split_output_root}/{data_name}_pretrain_p{ratio}_{date}
       仅 images/（+ 对应 NMF 缓存子集），供自监督预训练
-  {data_root}_finetune_train_p{ratio}_{date} / _val / _test
+  {split_output_root}/{data_name}_finetune_train_p{ratio}_{date} / _val / _test
       分割：images/ + masks/ + nmf_cache_xxx/；
       分类：{class}/images/ + {class}/nmf_cache_xxx/；
       检测：images/ + masks/ + ignore_masks/ + annotations/ +
@@ -29,6 +29,12 @@
      切分；检测数据集按 source_stem 等来源字段分组，并近似平衡图像数、
      可训练框总数与逐类别框数）。
   6. 所有输出目录中的数据文件均为软链接，指向原始数据项，不复制。
+
+输出位置：
+  默认在项目 ./data 下生成自动命名的 split 目录。也可以使用
+  --finetune-train-output-dir / --finetune-val-output-dir /
+  --finetune-test-output-dir 分别指定三个微调 split 的确切目录；显式目录
+  优先于 --split-output-root。预训练目录也可通过 --pretrain-output-dir 指定。
 
 用法示例（分割数据集）：
   ./scripts/run_split_pretrain_finetune_segmentation.sh
@@ -448,11 +454,37 @@ def format_ratio_tag(count: int, total: int) -> str:
 
 
 def build_output_dir(
-    data_root: Path, role: str, count: int, total: int, run_date: str,
+    data_root: Path,
+    role: str,
+    count: int,
+    total: int,
+    run_date: str,
+    split_output_root: Path | None = None,
+    explicit_output_dir: Path | None = None,
 ) -> Path:
-    """例如 data/MDC_..._pretrain_p030_20260717"""
+    """构造 split 输出路径；角色专属路径优先于统一输出根目录。"""
+    if explicit_output_dir is not None:
+        return explicit_output_dir
     ratio_tag = format_ratio_tag(count, total)
-    return Path(f"{data_root}_{role}_{ratio_tag}_{run_date}")
+    output_parent = split_output_root or data_root.parent
+    return output_parent / f"{data_root.name}_{role}_{ratio_tag}_{run_date}"
+
+
+def validate_output_dirs(data_root: Path, output_dirs: dict[str, Path]) -> None:
+    """拒绝覆盖源数据目录、写入源目录内部或让多个 split 共用同一路径。"""
+    source = data_root.resolve()
+    claimed: dict[Path, str] = {}
+    for role, output_dir in output_dirs.items():
+        resolved = output_dir.resolve()
+        if resolved == source or source in resolved.parents:
+            raise ValueError(
+                f"{role} 输出目录不能等于或位于 DATA_ROOT 内部: {output_dir}"
+            )
+        if resolved in claimed:
+            raise ValueError(
+                f"{role} 与 {claimed[resolved]} 指向同一输出目录: {output_dir}"
+            )
+        claimed[resolved] = role
 
 
 # ────────────────────────────────────────────────────────────────
@@ -998,11 +1030,57 @@ def run(args: argparse.Namespace) -> None:
                 f"无 mask 无法进入微调，这些样本不会写入任何目录"
             )
 
+    split_output_root = (
+        Path(args.split_output_root) if args.split_output_root else None
+    )
+    explicit_output_dirs = {
+        "pretrain": (
+            Path(args.pretrain_output_dir) if args.pretrain_output_dir else None
+        ),
+        "finetune_train": (
+            Path(args.finetune_train_output_dir)
+            if args.finetune_train_output_dir else None
+        ),
+        "finetune_val": (
+            Path(args.finetune_val_output_dir)
+            if args.finetune_val_output_dir else None
+        ),
+        "finetune_test": (
+            Path(args.finetune_test_output_dir)
+            if args.finetune_test_output_dir else None
+        ),
+    }
+
+    planned_output_dirs: dict[str, Path] = {}
+    if gen_pretrain:
+        planned_output_dirs["pretrain"] = build_output_dir(
+            data_root,
+            "pretrain",
+            len(all_splits["pretrain"]),
+            total_kept,
+            run_date,
+            split_output_root,
+            explicit_output_dirs["pretrain"],
+        )
+    if gen_finetune:
+        for split_key in ("finetune_train", "finetune_val", "finetune_test"):
+            count = len(all_splits[split_key])
+            if count == 0:
+                continue
+            planned_output_dirs[split_key] = build_output_dir(
+                data_root,
+                split_key,
+                count,
+                total_kept,
+                run_date,
+                split_output_root,
+                explicit_output_dirs[split_key],
+            )
+    validate_output_dirs(data_root, planned_output_dirs)
+
     pretrain_root: Path | None = None
     if gen_pretrain:
-        pretrain_root = build_output_dir(
-            data_root, "pretrain", len(all_splits["pretrain"]), total_kept, run_date,
-        )
+        pretrain_root = planned_output_dirs["pretrain"]
         print(f"\n生成 {pretrain_root} ...")
         materialize_pretrain(
             all_splits["pretrain"],
@@ -1014,17 +1092,12 @@ def run(args: argparse.Namespace) -> None:
 
     finetune_roots: dict[str, Path] = {}
     if gen_finetune:
-        finetune_roles = {
-            "finetune_train": "finetune_train",
-            "finetune_val": "finetune_val",
-            "finetune_test": "finetune_test",
-        }
-        for split_key, role in finetune_roles.items():
+        for split_key in ("finetune_train", "finetune_val", "finetune_test"):
             count = len(all_splits[split_key])
             if count == 0:
                 print(f"[warn] {split_key} 为空，跳过目录生成")
                 continue
-            out_root = build_output_dir(data_root, role, count, total_kept, run_date)
+            out_root = planned_output_dirs[split_key]
             finetune_roots[split_key] = out_root
             print(f"生成 {out_root} ...")
             materialize_finetune(
@@ -1065,6 +1138,11 @@ def run(args: argparse.Namespace) -> None:
         "finetune_test_ratio": args.finetune_test_ratio,
         "seed": args.seed,
         "run_date": run_date,
+        "split_output_root": str(split_output_root) if split_output_root else None,
+        "pretrain_output_dir": args.pretrain_output_dir,
+        "finetune_train_output_dir": args.finetune_train_output_dir,
+        "finetune_val_output_dir": args.finetune_val_output_dir,
+        "finetune_test_output_dir": args.finetune_test_output_dir,
         "classification_group_regex": args.classification_group_regex,
         "detection_group_field": args.detection_group_field,
         "exclude_json": str(Path(args.exclude_json)) if args.exclude_json else None,
@@ -1072,8 +1150,12 @@ def run(args: argparse.Namespace) -> None:
     if args.manifest_out:
         manifest_path = Path(args.manifest_out)
     else:
-        manifest_path = Path(f"{data_root}_split_manifest_{run_date}.json")
+        manifest_parent = split_output_root or data_root.parent
+        manifest_path = (
+            manifest_parent / f"{data_root.name}_split_manifest_{run_date}.json"
+        )
     if not args.dry_run:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path.write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False),
             encoding="utf-8",
@@ -1115,6 +1197,39 @@ def main() -> None:
         "--kind",
         choices=("segmentation", "classification", "detection"),
         required=True,
+    )
+    p.add_argument(
+        "--split-output-root",
+        type=str,
+        default="./data",
+        help=(
+            "自动命名的 split 输出根目录，默认 ./data；角色专属输出目录"
+            "未设置时生效"
+        ),
+    )
+    p.add_argument(
+        "--pretrain-output-dir",
+        type=str,
+        default=None,
+        help="预训练 split 的确切输出目录；留空时在 split-output-root 下自动命名",
+    )
+    p.add_argument(
+        "--finetune-train-output-dir",
+        type=str,
+        default=None,
+        help="微调 train split 的确切输出目录；留空时自动命名",
+    )
+    p.add_argument(
+        "--finetune-val-output-dir",
+        type=str,
+        default=None,
+        help="微调 val split 的确切输出目录；留空时自动命名",
+    )
+    p.add_argument(
+        "--finetune-test-output-dir",
+        type=str,
+        default=None,
+        help="微调 test split 的确切输出目录；留空时自动命名",
     )
     p.add_argument(
         "--class-dirs",
@@ -1208,7 +1323,10 @@ def main() -> None:
         "--manifest-out",
         type=str,
         default=None,
-        help="切分清单 json 输出路径，默认 {data_root}_split_manifest_{date}.json",
+        help=(
+            "切分清单 JSON 输出路径；默认保存在 split-output-root 下，命名为 "
+            "{data_name}_split_manifest_{date}.json"
+        ),
     )
     p.add_argument(
         "--dry-run",

@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # ── 数据集 ────────────────────────────────────────────────────────────────────
-DATA_ROOT="${DATA_ROOT:-data/2018WBC_detection_scene_1300x1800_noresize_contiguous20_b28to47_refcropminmax_20260902_1725}"
+DATA_ROOT="${DATA_ROOT:-/home/zsq/processed_data/DFS3R-main/data/GPCC_detection_patch_512x640_overlap_0x0_to_256x256_connected_component_c8_minmax}"
 
 # annotations/{stem}.json 的 images[0] 中用于来源隔离的字段。
 DETECTION_GROUP_FIELD="${DETECTION_GROUP_FIELD:-source_stem}"
@@ -29,6 +29,13 @@ RUN_DATE="${RUN_DATE:-}"
 MANIFEST_OUT="${MANIFEST_OUT:-}"
 DRY_RUN="${DRY_RUN:-0}"
 
+# 默认在项目 ./data 下自动命名；以下三个变量可分别指定确切目录。
+SPLIT_OUTPUT_ROOT="${SPLIT_OUTPUT_ROOT:-./data}"
+FINETUNE_TRAIN_OUTPUT_DIR="${FINETUNE_TRAIN_OUTPUT_DIR:-}"
+FINETUNE_VAL_OUTPUT_DIR="${FINETUNE_VAL_OUTPUT_DIR:-}"
+FINETUNE_TEST_OUTPUT_DIR="${FINETUNE_TEST_OUTPUT_DIR:-}"
+PRETRAIN_OUTPUT_DIR="${PRETRAIN_OUTPUT_DIR:-}"
+
 PYTHON_BIN="${PYTHON_BIN:-python}"
 SPLIT_PROGRAM="${SPLIT_PROGRAM:-split_pretrain_finetune.py}"
 SPLIT_RECORD_ROOT="${SPLIT_RECORD_ROOT:-./records/split_pretrain_finetune}"
@@ -45,6 +52,11 @@ echo "USE_SIMPLEX=${USE_SIMPLEX}  LAM_E=${LAM_E}  E_CLAMP_MAX=${E_CLAMP_MAX}"
 echo "MSE_THRESHOLD=${MSE_THRESHOLD}  PRETRAIN_RATIO=${PRETRAIN_RATIO}"
 echo "FINETUNE_VAL_RATIO=${FINETUNE_VAL_RATIO}  FINETUNE_TEST_RATIO=${FINETUNE_TEST_RATIO}"
 echo "SEED=${SEED}  MANIFEST_OUT=${MANIFEST_OUT:-<default>}  DRY_RUN=${DRY_RUN}"
+echo "SPLIT_OUTPUT_ROOT         = ${SPLIT_OUTPUT_ROOT}"
+echo "FINETUNE_TRAIN_OUTPUT_DIR = ${FINETUNE_TRAIN_OUTPUT_DIR:-<auto>}"
+echo "FINETUNE_VAL_OUTPUT_DIR   = ${FINETUNE_VAL_OUTPUT_DIR:-<auto>}"
+echo "FINETUNE_TEST_OUTPUT_DIR  = ${FINETUNE_TEST_OUTPUT_DIR:-<auto>}"
+echo "PRETRAIN_OUTPUT_DIR       = ${PRETRAIN_OUTPUT_DIR:-<auto>}"
 echo "记录保存至: ${SAVE_DIR}/records.txt"
 
 SIMPLEX_ARG=(--use-simplex)
@@ -55,10 +67,24 @@ MANIFEST_ARG=()
 if [ -n "${MANIFEST_OUT}" ]; then MANIFEST_ARG=(--manifest-out "${MANIFEST_OUT}"); fi
 DRY_RUN_ARG=()
 if [ "${DRY_RUN}" = "1" ]; then DRY_RUN_ARG=(--dry-run); fi
+OUTPUT_ARGS=(--split-output-root "${SPLIT_OUTPUT_ROOT}")
+if [ -n "${FINETUNE_TRAIN_OUTPUT_DIR}" ]; then
+    OUTPUT_ARGS+=(--finetune-train-output-dir "${FINETUNE_TRAIN_OUTPUT_DIR}")
+fi
+if [ -n "${FINETUNE_VAL_OUTPUT_DIR}" ]; then
+    OUTPUT_ARGS+=(--finetune-val-output-dir "${FINETUNE_VAL_OUTPUT_DIR}")
+fi
+if [ -n "${FINETUNE_TEST_OUTPUT_DIR}" ]; then
+    OUTPUT_ARGS+=(--finetune-test-output-dir "${FINETUNE_TEST_OUTPUT_DIR}")
+fi
+if [ -n "${PRETRAIN_OUTPUT_DIR}" ]; then
+    OUTPUT_ARGS+=(--pretrain-output-dir "${PRETRAIN_OUTPUT_DIR}")
+fi
 
 PYTHONUNBUFFERED=1 "${PYTHON_BIN}" "${SPLIT_PROGRAM}" \
     --data-root "${DATA_ROOT}" \
     --kind detection \
+    "${OUTPUT_ARGS[@]}" \
     --detection-group-field "${DETECTION_GROUP_FIELD}" \
     --k "${K}" --l1 "${L1}" --l2 "${L2}" --l3 "${L3}" \
     "${SIMPLEX_ARG[@]}" --lam-e "${LAM_E}" --e-clamp-max "${E_CLAMP_MAX}" \

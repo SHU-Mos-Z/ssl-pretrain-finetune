@@ -7,7 +7,7 @@ source "scripts/experiment_naming.sh"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6,7}"
 NUM_GPUS="${NUM_GPUS:-2}"
 BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-1}"
-GRADIENT_ACCUMULATION_STEPS=2
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"
 
 # 本实验固定使用 2026-09-05 划分；禁止按日期或比例自动发现其他目录。
 TRAIN_ROOT="${TRAIN_ROOT:-data/2018WBC_detection_scene_1300x1800_noresize_contiguous20_b28to47_refcropminmax_20260902_1725_finetune_train_p075_20260905}"
@@ -30,7 +30,7 @@ RUNTIME_VISIBLE_RATIO=0.70
 RUNTIME_MIN_VISIBLE_SIDE=32
 GLOBAL_NMS_THRESHOLD=0.5
 
-EPOCHS=100
+EPOCHS="${EPOCHS:-100}"
 LR="${LR:-2e-4}"
 BACKBONE_LR_MULT=0.1
 MIN_LR=1e-6
@@ -38,11 +38,15 @@ WEIGHT_DECAY=1e-4
 WARMUP_EPOCHS=5
 CLIP_GRAD=1.0
 SEED="${SEED:-42}"
-WORKERS=2
-PR_CURVE_INTERVAL=5
-EVALUATION_INTERVAL=5
-PROGRESS="log"
-LOG_INTERVAL=10
+WORKERS="${WORKERS:-4}"
+PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
+MAX_TRAIN_BATCHES="${MAX_TRAIN_BATCHES:-0}"
+MAX_EVAL_BATCHES="${MAX_EVAL_BATCHES:-0}"
+PR_CURVE_INTERVAL="${PR_CURVE_INTERVAL:-5}"
+EVALUATION_INTERVAL="${EVALUATION_INTERVAL:-5}"
+PROGRESS="${PROGRESS:-log}"
+LOG_INTERVAL="${LOG_INTERVAL:-10}"
 
 PATCH_SIZE=16
 SPECTRAL_PATCH_SIZE=5
@@ -107,9 +111,15 @@ fi
 
 DATASET_INFO="$(dataset_info_from_roots "$TRAIN_ROOT" "$VAL_ROOT" "$TEST_ROOT")-crop640x640-in512x512-s224x224-tok16-sp5"
 EXP_TIME=$(date +%Y%m%d_%H%M%S)
-SAVE_DIR="records/test_detection_wbc_0902/W-D1_${DATASET_INFO}_fcos_gated_seed${SEED}_${EXP_TIME}"
+SAVE_DIR="${SAVE_DIR:-records/test_detection_wbc_0902/W-D1_${DATASET_INFO}_fcos_gated_seed${SEED}_${EXP_TIME}}"
 mkdir -p "$SAVE_DIR"
 MASTER_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
+
+case "${PERSISTENT_WORKERS,,}" in
+    1|true|yes|on) PERSISTENT_WORKERS_ARG="--persistent-workers" ;;
+    0|false|no|off) PERSISTENT_WORKERS_ARG="--no-persistent-workers" ;;
+    *) echo "PERSISTENT_WORKERS must be true/false, got: $PERSISTENT_WORKERS"; exit 2 ;;
+esac
 
 OMP_NUM_THREADS=2 torchrun --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_PORT" \
     train_finetune_conditioned_detection.py \
@@ -130,9 +140,11 @@ OMP_NUM_THREADS=2 torchrun --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_P
     --gradient-accumulation-steps "$GRADIENT_ACCUMULATION_STEPS" \
     --lr "$LR" --backbone-lr-mult "$BACKBONE_LR_MULT" --min-lr "$MIN_LR" \
     --weight-decay "$WEIGHT_DECAY" --warmup-epochs "$WARMUP_EPOCHS" \
-    --clip-grad "$CLIP_GRAD" --workers "$WORKERS" --seed "$SEED" --amp --augment \
+    --clip-grad "$CLIP_GRAD" --workers "$WORKERS" "$PERSISTENT_WORKERS_ARG" \
+    --prefetch-factor "$PREFETCH_FACTOR" --seed "$SEED" --amp --augment \
     --pr-curve-interval "$PR_CURVE_INTERVAL" --evaluation-interval "$EVALUATION_INTERVAL" \
     --progress "$PROGRESS" --log-interval "$LOG_INTERVAL" \
+    --max-train-batches "$MAX_TRAIN_BATCHES" --max-eval-batches "$MAX_EVAL_BATCHES" \
     --patch-size "$PATCH_SIZE" --spectral-patch-size "$SPECTRAL_PATCH_SIZE" \
     --embed-dim "$EMBED_DIM" --vit-depth "$VIT_DEPTH" --vit-heads "$VIT_HEADS" \
     --mlp-ratio "$MLP_RATIO" --dropout "$DROPOUT" --cnn-stem-ch "$CNN_STEM_CH" \

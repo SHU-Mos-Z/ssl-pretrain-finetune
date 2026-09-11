@@ -75,6 +75,18 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--early-stop", action="store_true")
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--persistent-workers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep DataLoader workers alive between epochs (effective when workers > 0).",
+    )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=2,
+        help="Number of batches prefetched by each DataLoader worker.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-dir", default="records/finetune_conditioned_detection/run")
     parser.add_argument("--save-interval", type=int, default=10)
@@ -94,6 +106,18 @@ def get_args() -> argparse.Namespace:
         "--progress", choices=("tqdm", "log", "none"), default="log"
     )
     parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument(
+        "--max-train-batches",
+        type=int,
+        default=0,
+        help="Debug/smoke-test limit per training epoch; <=0 uses the full loader.",
+    )
+    parser.add_argument(
+        "--max-eval-batches",
+        type=int,
+        default=0,
+        help="Debug/smoke-test limit for each validation/test pass; <=0 uses all batches.",
+    )
     add_conditioned_model_arguments(parser)
     add_detection_arguments(parser)
     add_detection_view_arguments(parser)
@@ -111,6 +135,8 @@ def get_args() -> argparse.Namespace:
         parser.error("--pr-curve-interval must be non-negative")
     if args.evaluation_interval < 1:
         parser.error("--evaluation-interval must be positive")
+    if args.prefetch_factor < 1:
+        parser.error("--prefetch-factor must be positive")
     if not 0 <= args.augmentation_probability <= 1:
         parser.error("--augmentation-probability must be in [0,1]")
     return args
@@ -199,6 +225,8 @@ def main() -> None:
         args.test_annotation,
         batch_size=args.batch_size,
         num_workers=args.workers,
+        persistent_workers=args.persistent_workers,
+        prefetch_factor=args.prefetch_factor,
         distributed=distributed,
         rank=rank,
         world_size=world_size,
@@ -269,8 +297,13 @@ def main() -> None:
     optimizer = torch.optim.AdamW(groups, lr=args.lr, weight_decay=args.weight_decay)
     if not len(train_loader):
         raise RuntimeError("empty training loader")
+    train_batches_per_epoch = (
+        min(len(train_loader), args.max_train_batches)
+        if args.max_train_batches > 0
+        else len(train_loader)
+    )
     optimizer_steps_per_epoch = math.ceil(
-        len(train_loader) / args.gradient_accumulation_steps
+        train_batches_per_epoch / args.gradient_accumulation_steps
     )
     scheduler = build_cosine_scheduler(
         optimizer,
@@ -336,6 +369,13 @@ def main() -> None:
             f"effective_batch={args.batch_size * world_size * args.gradient_accumulation_steps}",
             flush=True,
         )
+        print(
+            f"[DataLoader] workers/rank={args.workers} "
+            f"persistent_workers={args.persistent_workers and args.workers > 0} "
+            f"prefetch_factor={args.prefetch_factor if args.workers > 0 else 'disabled'} "
+            f"pin_memory=True",
+            flush=True,
+        )
 
     history_path = save_dir / "history.jsonl"
     curve_monitor = (
@@ -358,19 +398,22 @@ def main() -> None:
         if args.progress == "tqdm" and rank == 0:
             iterable = tqdm(
                 iterable,
-                total=len(train_loader),
+                total=train_batches_per_epoch,
                 desc=f"Det {epoch:04d}",
                 leave=False,
             )
         for step, (model_inputs, targets) in iterable:
+            if step > train_batches_per_epoch:
+                break
             model_inputs = move_model_inputs(model_inputs, device)
             group_start = ((step - 1) // args.gradient_accumulation_steps) * args.gradient_accumulation_steps + 1
             group_size = min(
                 args.gradient_accumulation_steps,
-                len(train_loader) - group_start + 1,
+                train_batches_per_epoch - group_start + 1,
             )
             should_step = (
-                step % args.gradient_accumulation_steps == 0 or step == len(train_loader)
+                step % args.gradient_accumulation_steps == 0
+                or step == train_batches_per_epoch
             )
             synchronization = (
                 model.no_sync()
@@ -394,13 +437,19 @@ def main() -> None:
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
             batch_size = len(targets)
-            totals[0] += float(losses["loss_total"].detach()) * batch_size
-            totals[1] += float(losses["loss_cls"].detach()) * batch_size
-            totals[2] += float(losses["loss_box"].detach()) * batch_size
-            totals[3] += float(losses.get("loss_centerness", torch.tensor(0.0)).detach()) * batch_size
-            totals[4] += float(losses["num_positive"].detach())
-            totals[5] += float(losses["num_negative"].detach())
-            totals[6] += float(losses["num_ignored"].detach())
+            # Keep epoch statistics on-device.  Converting every scalar loss to
+            # Python here forces several CUDA synchronizations per batch and
+            # leaves the next prefetched batch waiting behind an idle GPU.
+            totals[0].add_(losses["loss_total"].detach().to(torch.float64), alpha=batch_size)
+            totals[1].add_(losses["loss_cls"].detach().to(torch.float64), alpha=batch_size)
+            totals[2].add_(losses["loss_box"].detach().to(torch.float64), alpha=batch_size)
+            if "loss_centerness" in losses:
+                totals[3].add_(
+                    losses["loss_centerness"].detach().to(torch.float64), alpha=batch_size
+                )
+            totals[4].add_(losses["num_positive"].detach().to(torch.float64))
+            totals[5].add_(losses["num_negative"].detach().to(torch.float64))
+            totals[6].add_(losses["num_ignored"].detach().to(torch.float64))
             totals[7] += batch_size
             if (
                 args.progress == "log"
@@ -409,7 +458,7 @@ def main() -> None:
                 and step % args.log_interval == 0
             ):
                 print(
-                    f"[Train] epoch={epoch} step={step}/{len(train_loader)} "
+                    f"[Train] epoch={epoch} step={step}/{train_batches_per_epoch} "
                     f"loss={float(losses['loss_total']):.5f} "
                     f"pos={int(losses['num_positive'])} neg={int(losses['num_negative'])} "
                     f"ignore={int(losses['num_ignored'])}",
@@ -450,6 +499,7 @@ def main() -> None:
                     if save_pr_curve
                     else None
                 ),
+                max_batches=args.max_eval_batches,
             )
             current_ap = float(val_metrics["AP50_95"])
             improved = current_ap > best_ap or best_ap < 0
@@ -547,6 +597,7 @@ def main() -> None:
             distributed=distributed,
             rank=rank,
             output_dir=save_dir / "test_best" if rank == 0 else None,
+            max_batches=args.max_eval_batches,
         )
         if rank == 0:
             print(

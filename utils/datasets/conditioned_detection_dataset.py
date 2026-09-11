@@ -18,8 +18,11 @@ from torch.utils.data.distributed import DistributedSampler
 from utils.physics.beer_lambert import intensity_to_od_np
 from utils.preprocessing.offline_nmf import cache_dir_name
 from utils.tokenization.band_padding import band_pad_amounts, pad_bands
+from utils.tokenization.patch_tokens import compute_patch_token_raw, grid_sizes
+from utils.tokenization.positional_targets import compute_pe_spatial
 from utils.tokenization.spectral_metadata import load_wavelengths, token_spectral_positions
-from utils.tokenization.token_builder import TokenBuildConfig, build_tokens
+from utils.tokenization.spectral_groups import SpectralGroups
+from utils.tokenization.token_builder import TokenBuildConfig
 from utils.datasets.detection_view_geometry import (
     DetectionView,
     DetectionViewConfig,
@@ -556,30 +559,36 @@ class ConditionedDetectionDataset(Dataset):
         spectral_bands = int(od.shape[0])
         if spectral_bands != self.wavelengths.size:
             raise ValueError("padded intensity/wavelength size mismatch")
-        dummy_abundance = np.full(
-            (endmembers.shape[0], output_height, output_width),
-            1.0 / endmembers.shape[0],
-            np.float32,
+        # Detection only consumes OD tokens and positional metadata.  The
+        # generic pre-training builder would additionally allocate a dense
+        # KxHxW dummy abundance map, abundance tokens and abundance positions;
+        # none of those tensors is returned by this Dataset.  Build exactly the
+        # consumed fields with the same ordering and formulae instead.
+        n_sp = self.token_config.num_groups_for(spectral_bands)
+        groups = SpectralGroups(spectral_bands, n_sp)
+        h_p, w_p = grid_sizes(output_height, output_width, self.token_config.patch_size)
+        token_raw = compute_patch_token_raw(od, self.token_config.patch_size, groups)
+        pe_spatial = compute_pe_spatial(
+            output_height, output_width, self.token_config.patch_size, groups
         )
-        tokens = build_tokens(od, dummy_abundance, self.token_config)
-        tokens.pe_spectral[:] = token_spectral_positions(
+        pe_spectral = token_spectral_positions(
             self.wavelengths,
-            tokens.h_p,
-            tokens.w_p,
-            tokens.s_p,
+            h_p,
+            w_p,
+            groups.patch_size,
         )
         model_inputs = {
             "od": torch.from_numpy(od),
             "intensity": torch.from_numpy(intensity.astype(np.float32, copy=False)),
             "e_star": torch.from_numpy(endmembers),
             "wavelengths": torch.from_numpy(self.wavelengths.copy()),
-            "token_raw": torch.from_numpy(tokens.token_raw),
-            "token_visible": torch.ones((tokens.h_p, tokens.w_p, tokens.n_sp), dtype=torch.bool),
+            "token_raw": torch.from_numpy(token_raw),
+            "token_visible": torch.ones((h_p, w_p, n_sp), dtype=torch.bool),
             "voxel_visible": torch.ones(
                 (spectral_bands, output_height, output_width), dtype=torch.bool
             ),
-            "pe_spatial": torch.from_numpy(tokens.pe_spatial),
-            "pe_spectral": torch.from_numpy(tokens.pe_spectral),
+            "pe_spatial": torch.from_numpy(pe_spatial),
+            "pe_spectral": torch.from_numpy(pe_spectral),
         }
         target = {
             "boxes": torch.from_numpy(boxes),
@@ -669,12 +678,18 @@ def build_conditioned_detection_loaders(
     *,
     batch_size: int = 2,
     num_workers: int = 4,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 2,
     distributed: bool = False,
     rank: int = 0,
     world_size: int = 1,
     augment: bool = True,
     **dataset_kwargs,
 ):
+    if num_workers < 0:
+        raise ValueError("num_workers must be non-negative")
+    if prefetch_factor < 1:
+        raise ValueError("prefetch_factor must be positive")
     train_dataset = ConditionedDetectionDataset(
         train_root,
         train_annotation,
@@ -723,13 +738,15 @@ def build_conditioned_detection_loaders(
         if distributed and test_dataset is not None
         else None
     )
-    common = dict(
+    common: dict[str, Any] = dict(
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=True,
         collate_fn=conditioned_detection_collate,
-        persistent_workers=num_workers > 0,
     )
+    if num_workers > 0:
+        common["persistent_workers"] = bool(persistent_workers)
+        common["prefetch_factor"] = int(prefetch_factor)
     train_loader = DataLoader(
         train_dataset,
         shuffle=train_sampler is None,

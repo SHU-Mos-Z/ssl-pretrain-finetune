@@ -179,6 +179,7 @@ def evaluate_detection_model(
     output_dir: str | Path | None = None,
     visualization_samples: int = 0,
     pr_curve_path: str | Path | None = None,
+    max_batches: int = 0,
 ) -> dict[str, Any]:
     model.eval()
     # The no-duplicate eval sampler may assign zero batches to a rank. Calling
@@ -189,7 +190,9 @@ def evaluate_detection_model(
     view_config = getattr(dataset, "view_config", None)
     runtime_window = bool(view_config is not None and view_config.view_mode == "runtime_window")
     local: list[dict[str, Any]] = []
-    for model_inputs, targets in loader:
+    for batch_index, (model_inputs, targets) in enumerate(loader, start=1):
+        if max_batches > 0 and batch_index > max_batches:
+            break
         model_inputs = move_model_inputs(model_inputs, device)
         with torch.amp.autocast(
             "cuda", dtype=torch.bfloat16, enabled=amp and device.type == "cuda"
@@ -234,6 +237,23 @@ def evaluate_detection_model(
                 gathered,
                 nms_threshold=float(view_config.global_nms_threshold),
                 max_detections=int(postprocessor.config.max_detections),
+            )
+        if max_batches > 0:
+            # Smoke tests intentionally traverse only a prefix of each rank's
+            # evaluation shard.  The strict COCO adapter still requires one
+            # prediction record per source image, so represent unvisited
+            # sources as empty predictions.  Full evaluation (max_batches=0)
+            # never enters this debug-only path.
+            observed_ids = {int(item["image_id"]) for item in gathered}
+            gathered.extend(
+                {
+                    "image_id": int(image_id),
+                    "boxes": [],
+                    "scores": [],
+                    "labels": [],
+                }
+                for image_id in dataset.image_ids
+                if int(image_id) not in observed_ids
             )
         gathered.sort(key=lambda item: int(item["image_id"]))
         output_path = Path(output_dir) if output_dir is not None else None
