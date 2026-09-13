@@ -5,7 +5,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # ── 数据集 ────────────────────────────────────────────────────────────────────
-DATA_ROOT="${DATA_ROOT:-/home/zsq/processed_data/DFS3R-main/data/GPCC_detection_patch_512x640_overlap_0x0_to_256x256_connected_component_c8_minmax}"
+# DATA_ROOT="${DATA_ROOT:-/home/zsq/processed_data/DFS3R-main/data/GPCC_detection_patch_512x640_overlap_0x0_to_256x320_connected_component_c8_minmax_20260913}"
+DATA_ROOT="${DATA_ROOT:-/home/zsq/processed_data/DFS3R-main/data/GPCC_detection_patch_512x640_overlap_0x0_native_resolution_connected_component_c8_minmax_20260913}"
 
 # annotations/{stem}.json 的 images[0] 中用于来源隔离的字段。
 DETECTION_GROUP_FIELD="${DETECTION_GROUP_FIELD:-source_stem}"

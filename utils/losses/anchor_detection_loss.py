@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from models.detection_contracts import DetectionConfig
 from models.modules_detection import AnchorMatcher, BoxCoder
-from models.modules_detection.box_ops import generalized_box_iou, sigmoid_focal_loss
+from models.modules_detection.box_ops import aligned_box_iou, generalized_box_iou, sigmoid_focal_loss
 from .detection_common import distributed_normalizer, target_to_device
 
 
@@ -30,6 +30,11 @@ class AnchorDetectionLoss(nn.Module):
         anchors = torch.cat(output["anchors"], dim=0)
         logits = torch.cat(output["cls_logits"], dim=1).float()
         deltas = torch.cat(output["bbox_deltas"], dim=1).float()
+        quality_logits = (
+            torch.cat(output["quality_logits"], dim=1).float()
+            if self.config.quality_mode == "iou"
+            else None
+        )
         if logits.shape[:2] != (len(targets), len(anchors)):
             raise ValueError("anchor predictions do not match target batch/anchor count")
         device = logits.device
@@ -46,6 +51,7 @@ class AnchorDetectionLoss(nn.Module):
 
         cls_loss = logits.sum() * 0.0
         box_loss = deltas.sum() * 0.0
+        quality_loss = deltas.sum() * 0.0
         for batch_index, (target, states, matched) in enumerate(assignments):
             valid = states != AnchorMatcher.IGNORE
             positive = states == AnchorMatcher.POSITIVE
@@ -78,14 +84,31 @@ class AnchorDetectionLoss(nn.Module):
                         positive_anchors, deltas[batch_index, positive]
                     )
                     box_loss = box_loss + (1.0 - generalized_box_iou(decoded, gt_boxes)).sum()
+                if quality_logits is not None:
+                    if self.config.box_loss == "smooth_l1":
+                        decoded = self.box_coder.decode(
+                            positive_anchors, deltas[batch_index, positive]
+                        )
+                    quality_target = aligned_box_iou(decoded.detach(), gt_boxes).clamp(0, 1)
+                    quality_loss = quality_loss + F.binary_cross_entropy_with_logits(
+                        quality_logits[batch_index, positive],
+                        quality_target,
+                        reduction="sum",
+                    )
 
         cls_loss = cls_loss / normalizer
         box_loss = box_loss / normalizer
-        total = cls_loss + self.config.box_loss_weight * box_loss
+        quality_loss = quality_loss / normalizer
+        total = (
+            cls_loss
+            + self.config.box_loss_weight * box_loss
+            + self.config.quality_loss_weight * quality_loss
+        )
         return {
             "loss_total": total,
             "loss_cls": cls_loss,
             "loss_box": box_loss,
+            "loss_quality": quality_loss,
             "num_positive": torch.tensor(float(total_positive), device=device),
             "num_negative": torch.tensor(float(total_negative), device=device),
             "num_ignored": torch.tensor(float(total_ignored), device=device),

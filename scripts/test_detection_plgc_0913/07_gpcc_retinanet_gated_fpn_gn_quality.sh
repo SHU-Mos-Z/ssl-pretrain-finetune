@@ -1,42 +1,46 @@
 #!/bin/bash
-# GPCC/PLGC-IM D2: preprocessed 256x256 view + gated pyramid + RetinaNet.
+# GPCC 0913 E07: retinanet + gated_fpn + GroupNorm + IoU quality.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 source "scripts/experiment_naming.sh"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6,7}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,7}"
 NUM_GPUS="${NUM_GPUS:-2}"
 BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-4}"
-GRADIENT_ACCUMULATION_STEPS=1
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
-# 固定使用 2026-08-17 的同一份划分；不自动搜索其他日期或比例的数据目录。
-TRAIN_ROOT="${TRAIN_ROOT:-data/GPCC_detection_patch_512x640_overlap_0x0_to_256x256_connected_component_c8_minmax_finetune_train_p072_20260817}"
-VAL_ROOT="${VAL_ROOT:-data/GPCC_detection_patch_512x640_overlap_0x0_to_256x256_connected_component_c8_minmax_finetune_val_p014_20260817}"
-TEST_ROOT="${TEST_ROOT:-data/GPCC_detection_patch_512x640_overlap_0x0_to_256x256_connected_component_c8_minmax_finetune_test_p014_20260817}"
-TRAIN_ANNOTATION="annotations"
-VAL_ANNOTATION="annotations"
-TEST_ANNOTATION="annotations"
+TRAIN_ROOT="${TRAIN_ROOT:-data/GPCC_detection_patch_512x640_overlap_0x0_to_256x320_connected_component_c8_minmax_finetune_train_p072_20260913}"
+VAL_ROOT="${VAL_ROOT:-data/GPCC_detection_patch_512x640_overlap_0x0_to_256x320_connected_component_c8_minmax_finetune_val_p014_20260913}"
+TEST_ROOT="${TEST_ROOT:-data/GPCC_detection_patch_512x640_overlap_0x0_to_256x320_connected_component_c8_minmax_finetune_test_p014_20260913}"
+TRAIN_ANNOTATION="${TRAIN_ANNOTATION:-annotations}"
+VAL_ANNOTATION="${VAL_ANNOTATION:-annotations}"
+TEST_ANNOTATION="${TEST_ANNOTATION:-annotations}"
 PRETRAIN_CKPT="${PRETRAIN_CKPT:-records/pretrain_conditioned/20260817_005610/ckpt_last.pth}"
 
 DETECTION_MODE="anchor_based"
-DET_FEATURE_MODE="gated_pyramid"
+DET_FEATURE_MODE="gated_fpn"
+DET_HEAD_NORM="group_norm"
+DET_HEAD_NORM_GROUPS="${DET_HEAD_NORM_GROUPS:-32}"
+DET_QUALITY_MODE="iou"
+QUALITY_LOSS_WEIGHT="${QUALITY_LOSS_WEIGHT:-1.0}"
+QUALITY_SCORE_POWER="${QUALITY_SCORE_POWER:-0.5}"
 DETECTION_VIEW_MODE="direct"
 
-EPOCHS=100
+EPOCHS="${EPOCHS:-100}"
 LR="${LR:-4e-4}"
-BACKBONE_LR_MULT=0.01
-MIN_LR=1e-6
-WEIGHT_DECAY=1e-4
-WARMUP_EPOCHS=5
-CLIP_GRAD=1.0
+BACKBONE_LR_MULT="${BACKBONE_LR_MULT:-0.01}"
+MIN_LR="${MIN_LR:-1e-6}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
+WARMUP_EPOCHS="${WARMUP_EPOCHS:-5}"
+CLIP_GRAD="${CLIP_GRAD:-1.0}"
 SEED="${SEED:-42}"
-AMP=true
-AUGMENT=true
-FREEZE_BACKBONE=false
+AMP="${AMP:-true}"
+AUGMENT="${AUGMENT:-true}"
+FREEZE_BACKBONE="${FREEZE_BACKBONE:-false}"
 
-PATCH_SIZE=16
-SPECTRAL_PATCH_SIZE=5
+PATCH_SIZE="${PATCH_SIZE:-16}"
+SPECTRAL_PATCH_SIZE="${SPECTRAL_PATCH_SIZE:-5}"
 EMBED_DIM=256
 VIT_DEPTH=6
 VIT_HEADS=8
@@ -54,24 +58,28 @@ ALPHA_MIN=0.1
 ALPHA_EXTRA=1.0
 OD_MAX=3.0
 
-DET_FEATURE_DIM=128
-HEAD_DEPTH=4
+DET_FEATURE_DIM="${DET_FEATURE_DIM:-128}"
+HEAD_DEPTH="${HEAD_DEPTH:-4}"
+HEAD_NORM_GROUPS="${HEAD_NORM_GROUPS:-$DET_HEAD_NORM_GROUPS}"
 POSITIVE_IOU=0.5
 NEGATIVE_IOU=0.4
 IGNORE_IOU=0.5
 BOX_LOSS="giou"
 FOCAL_ALPHA=0.25
 FOCAL_GAMMA=2.0
-SCORE_THRESHOLD=0.05
-NMS_THRESHOLD=0.5
-PRE_NMS_TOPK=1000
-MAX_DETECTIONS=100
+CENTERNESS_LOSS_WEIGHT=1.0
 
-# 只依据固定训练集 GT 拟合。256x256 crop 等于整张模型输入，因此拟合过程中
-# 不会产生额外的运行时裁剪；dry-run 会在该步骤之前退出。
-ANCHOR_CONFIG_JSON="records/test_detection_plgc_0905/anchor_fit_GPCC_train_p072_direct256_seed${SEED}.json"
-ANCHOR_SOURCE_CROP_SIZE="256,256"
-ANCHOR_MODEL_INPUT_SIZE="256,256"
+AP_SCORE_THRESHOLD="${AP_SCORE_THRESHOLD:-0.05}"
+DEPLOY_SCORE_THRESHOLD="${DEPLOY_SCORE_THRESHOLD:-}"
+VIS_SCORE_THRESHOLD="${VIS_SCORE_THRESHOLD:-}"
+VIS_MAX_DETECTIONS="${VIS_MAX_DETECTIONS:-30}"
+THRESHOLD_CALIBRATION_IOU="${THRESHOLD_CALIBRATION_IOU:-0.5}"
+THRESHOLD_SEARCH_MIN="${THRESHOLD_SEARCH_MIN:-0.05}"
+THRESHOLD_SEARCH_MAX="${THRESHOLD_SEARCH_MAX:-0.90}"
+THRESHOLD_SEARCH_STEP="${THRESHOLD_SEARCH_STEP:-0.01}"
+NMS_THRESHOLD="${NMS_THRESHOLD:-0.5}"
+PRE_NMS_TOPK="${PRE_NMS_TOPK:-1000}"
+MAX_DETECTIONS="${MAX_DETECTIONS:-100}"
 
 NMF_K=16
 NMF_L1=5e-4
@@ -84,13 +92,13 @@ NMF_CACHE_NAME="nmf_cache_K16_l15e-4_l22e-4_l31e-2_le0.05_ec3_simplex"
 ALLOW_INDEX_WAVELENGTHS=true
 WAVELENGTH_FILE=""
 
-WORKERS=2
+WORKERS="${WORKERS:-2}"
 SAVE_INTERVAL=10
 EVALUATION_INTERVAL=5
 PR_CURVE_INTERVAL=5
 TEST_VISUALIZATION_SAMPLES="${TEST_VISUALIZATION_SAMPLES:-12}"
-PROGRESS="log"
-LOG_INTERVAL=10
+PROGRESS="${PROGRESS:-log}"
+LOG_INTERVAL="${LOG_INTERVAL:-10}"
 
 for root in "$TRAIN_ROOT" "$VAL_ROOT" "$TEST_ROOT"; do
     for required in images masks ignore_masks annotations "$NMF_CACHE_NAME"; do
@@ -109,31 +117,44 @@ if [ ! -f "$PRETRAIN_CKPT" ]; then
     exit 1
 fi
 
+DATASET_INFO="$(dataset_info_from_roots "$TRAIN_ROOT" "$VAL_ROOT" "$TEST_ROOT")"
+INPUT_SHAPE="$("$PYTHON_BIN" -c 'from pathlib import Path; import numpy as np, sys; p=next((Path(sys.argv[1])/"images").glob("*.npy")); a=np.load(p, mmap_mode="r"); print(a.shape[0], a.shape[1])' "$TRAIN_ROOT")"
+read -r INPUT_HEIGHT INPUT_WIDTH <<< "$INPUT_SHAPE"
+INPUT_SIZE="${INPUT_HEIGHT}x${INPUT_WIDTH}"
+if [[ "$DATASET_INFO" != *"$INPUT_SIZE"* ]]; then
+    DATASET_INFO="${DATASET_INFO}-${INPUT_SIZE}"
+fi
+if (( INPUT_HEIGHT % PATCH_SIZE != 0 || INPUT_WIDTH % PATCH_SIZE != 0 )); then
+    echo "Input size $INPUT_SIZE is not divisible by PATCH_SIZE=$PATCH_SIZE" >&2
+    exit 1
+fi
+
 echo "TRAIN_ROOT=$TRAIN_ROOT"
 echo "VAL_ROOT=$VAL_ROOT"
 echo "TEST_ROOT=$TEST_ROOT"
-echo "DETECTION_VIEW_MODE=$DETECTION_VIEW_MODE  DETECTION_MODE=$DETECTION_MODE"
+echo "INPUT_SIZE=$INPUT_SIZE DETECTION_MODE=$DETECTION_MODE FEATURE=$DET_FEATURE_MODE HEAD_NORM=$DET_HEAD_NORM QUALITY=$DET_QUALITY_MODE"
 if [ "${DRY_RUN:-0}" = "1" ]; then
-    echo "DRY_RUN=1: fixed split paths, annotations, NMF caches and checkpoint passed validation; anchor fitting and training were not started."
+    echo "DRY_RUN=1: inputs and configuration passed validation; training was not started."
     exit 0
 fi
 
+ANCHOR_CONFIG_JSON="${ANCHOR_CONFIG_JSON:-records/test_detection_plgc_0913/anchor_fit_${DATASET_INFO}_seed${SEED}.json}"
 mkdir -p "$(dirname "$ANCHOR_CONFIG_JSON")"
 if [ ! -f "$ANCHOR_CONFIG_JSON" ]; then
     "$PYTHON_BIN" scripts/fit_wbc_detection_anchors.py \
         --data-root "$TRAIN_ROOT" --annotation "$TRAIN_ANNOTATION" \
-        --source-crop-size "$ANCHOR_SOURCE_CROP_SIZE" \
-        --model-input-size "$ANCHOR_MODEL_INPUT_SIZE" \
+        --source-crop-size "$INPUT_HEIGHT,$INPUT_WIDTH" \
+        --model-input-size "$INPUT_HEIGHT,$INPUT_WIDTH" \
         --views-per-source 1 --simulation-epochs 1 \
         --positive-guided-fraction 1.0 --visible-ratio 0.0 --min-visible-side 0.0 \
         --seed "$SEED" --output "$ANCHOR_CONFIG_JSON"
 fi
+DETECTOR_GEOMETRY_ARGS=(--anchor-config-json "$ANCHOR_CONFIG_JSON")
 
-DATASET_INFO="$(dataset_info_from_roots "$TRAIN_ROOT" "$VAL_ROOT" "$TEST_ROOT")-direct256-tok${PATCH_SIZE}-sp${SPECTRAL_PATCH_SIZE}"
+
 EXP_TIME=$(date +%Y%m%d_%H%M%S)
-SAVE_DIR="records/test_detection_plgc_0905/GPCC-D2_${DATASET_INFO}_retinanet_gated_seed${SEED}_${EXP_TIME}"
+SAVE_DIR="records/test_detection_plgc_0913/GPCC-E07_${DATASET_INFO}-direct-tok${PATCH_SIZE}-sp${SPECTRAL_PATCH_SIZE}_retinanet-gated_fpn-gn_quality_seed${SEED}_${EXP_TIME}"
 mkdir -p "$SAVE_DIR"
-echo "ANCHOR_CONFIG_JSON=$ANCHOR_CONFIG_JSON"
 echo "SAVE_DIR=$SAVE_DIR"
 
 OPTIONAL_ARGS=()
@@ -143,8 +164,10 @@ if [ "$FREEZE_BACKBONE" = true ]; then OPTIONAL_ARGS+=(--freeze-backbone); fi
 if [ "$NMF_SIMPLEX" = true ]; then OPTIONAL_ARGS+=(--nmf-simplex); else OPTIONAL_ARGS+=(--no-nmf-simplex); fi
 if [ "$ALLOW_INDEX_WAVELENGTHS" = true ]; then OPTIONAL_ARGS+=(--allow-index-wavelengths); fi
 if [ -n "$WAVELENGTH_FILE" ]; then OPTIONAL_ARGS+=(--wavelength-file "$WAVELENGTH_FILE"); fi
+if [ -n "$DEPLOY_SCORE_THRESHOLD" ]; then OPTIONAL_ARGS+=(--deployment-score-threshold "$DEPLOY_SCORE_THRESHOLD"); fi
+if [ -n "$VIS_SCORE_THRESHOLD" ]; then OPTIONAL_ARGS+=(--visualization-score-threshold "$VIS_SCORE_THRESHOLD"); fi
 
-MASTER_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
+MASTER_PORT=$("$PYTHON_BIN" -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
 OMP_NUM_THREADS=2 torchrun --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_PORT" \
     train_finetune_conditioned_detection.py \
     --train-root "$TRAIN_ROOT" --train-annotation "$TRAIN_ANNOTATION" \
@@ -152,7 +175,9 @@ OMP_NUM_THREADS=2 torchrun --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_P
     --test-root "$TEST_ROOT" --test-annotation "$TEST_ANNOTATION" \
     --pretrain-ckpt "$PRETRAIN_CKPT" \
     --detection-mode "$DETECTION_MODE" --det-feature-mode "$DET_FEATURE_MODE" \
-    --detection-view-mode "$DETECTION_VIEW_MODE" \
+    --det-head-norm "$DET_HEAD_NORM" --det-head-norm-groups "$HEAD_NORM_GROUPS" \
+    --det-quality-mode "$DET_QUALITY_MODE" --quality-loss-weight "$QUALITY_LOSS_WEIGHT" \
+    --quality-score-power "$QUALITY_SCORE_POWER" --detection-view-mode "$DETECTION_VIEW_MODE" \
     --epochs "$EPOCHS" --batch-size "$BATCH_SIZE_PER_GPU" \
     --gradient-accumulation-steps "$GRADIENT_ACCUMULATION_STEPS" \
     --lr "$LR" --backbone-lr-mult "$BACKBONE_LR_MULT" --min-lr "$MIN_LR" \
@@ -161,6 +186,10 @@ OMP_NUM_THREADS=2 torchrun --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_P
     --save-interval "$SAVE_INTERVAL" --evaluation-interval "$EVALUATION_INTERVAL" \
     --pr-curve-interval "$PR_CURVE_INTERVAL" \
     --test-visualization-samples "$TEST_VISUALIZATION_SAMPLES" \
+    --visualization-max-detections "$VIS_MAX_DETECTIONS" \
+    --threshold-calibration-iou "$THRESHOLD_CALIBRATION_IOU" \
+    --threshold-search-min "$THRESHOLD_SEARCH_MIN" --threshold-search-max "$THRESHOLD_SEARCH_MAX" \
+    --threshold-search-step "$THRESHOLD_SEARCH_STEP" \
     --progress "$PROGRESS" --log-interval "$LOG_INTERVAL" \
     --patch-size "$PATCH_SIZE" --spectral-patch-size "$SPECTRAL_PATCH_SIZE" \
     --embed-dim "$EMBED_DIM" --vit-depth "$VIT_DEPTH" --vit-heads "$VIT_HEADS" \
@@ -171,11 +200,12 @@ OMP_NUM_THREADS=2 torchrun --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_P
     --confidence-temperature "$CONFIDENCE_TEMPERATURE" --alpha-min "$ALPHA_MIN" \
     --alpha-extra "$ALPHA_EXTRA" --od-max "$OD_MAX" \
     --det-feature-dim "$DET_FEATURE_DIM" --head-depth "$HEAD_DEPTH" \
-    --anchor-config-json "$ANCHOR_CONFIG_JSON" \
+    "${DETECTOR_GEOMETRY_ARGS[@]}" \
     --positive-iou-threshold "$POSITIVE_IOU" --negative-iou-threshold "$NEGATIVE_IOU" \
     --ignore-iou-threshold "$IGNORE_IOU" --box-loss "$BOX_LOSS" \
     --focal-alpha "$FOCAL_ALPHA" --focal-gamma "$FOCAL_GAMMA" \
-    --score-threshold "$SCORE_THRESHOLD" --nms-threshold "$NMS_THRESHOLD" \
+    --centerness-loss-weight "$CENTERNESS_LOSS_WEIGHT" \
+    --ap-score-threshold "$AP_SCORE_THRESHOLD" --nms-threshold "$NMS_THRESHOLD" \
     --pre-nms-topk "$PRE_NMS_TOPK" --max-detections "$MAX_DETECTIONS" \
     --nmf-k "$NMF_K" --nmf-l1 "$NMF_L1" --nmf-l2 "$NMF_L2" --nmf-l3 "$NMF_L3" \
     --nmf-lam-e "$NMF_LAM_E" --nmf-e-clamp-max "$NMF_E_CLAMP_MAX" \

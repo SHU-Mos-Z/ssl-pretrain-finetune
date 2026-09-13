@@ -110,6 +110,97 @@ def per_image_detection_metrics(
     return rows
 
 
+def filter_prediction_records(
+    records: list[dict[str, Any]],
+    score_threshold: float,
+    max_detections_per_image: int | None = None,
+) -> list[dict[str, Any]]:
+    """Filter already-NMSed COCO records without changing their score order."""
+
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for record in records:
+        if float(record["score"]) >= float(score_threshold):
+            grouped.setdefault(int(record["image_id"]), []).append(record)
+    filtered: list[dict[str, Any]] = []
+    for image_id in sorted(grouped):
+        items = sorted(grouped[image_id], key=lambda item: float(item["score"]), reverse=True)
+        if max_detections_per_image is not None:
+            items = items[: int(max_detections_per_image)]
+        filtered.extend(items)
+    return filtered
+
+
+def detection_operating_point(
+    coco_payload: dict[str, Any],
+    records: list[dict[str, Any]],
+    *,
+    score_threshold: float,
+    iou_threshold: float = 0.5,
+    max_detections_per_image: int | None = None,
+) -> dict[str, float | int]:
+    """Micro precision/recall/F1 at one deployment operating point."""
+
+    filtered = filter_prediction_records(
+        records, score_threshold, max_detections_per_image
+    )
+    rows = per_image_detection_metrics(coco_payload, filtered, iou_threshold)
+    tp = sum(int(row["tp_iou50"]) for row in rows)
+    fp = sum(int(row["fp_iou50"]) for row in rows)
+    fn = sum(int(row["fn_iou50"]) for row in rows)
+    ignored = sum(int(row["ignored_predictions"]) for row in rows)
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
+    return {
+        "score_threshold": float(score_threshold),
+        "iou_threshold": float(iou_threshold),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "true_positives": int(tp),
+        "false_positives": int(fp),
+        "false_negatives": int(fn),
+        "ignored_predictions": int(ignored),
+        "num_predictions": int(len(filtered)),
+    }
+
+
+def calibrate_score_threshold(
+    coco_payload: dict[str, Any],
+    records: list[dict[str, Any]],
+    *,
+    minimum: float = 0.05,
+    maximum: float = 0.90,
+    step: float = 0.01,
+    iou_threshold: float = 0.5,
+) -> tuple[dict[str, float | int | str], list[dict[str, float | int]]]:
+    """Select a global score threshold by maximum validation micro-F1."""
+
+    if not 0 <= minimum <= maximum <= 1 or step <= 0:
+        raise ValueError("invalid score-threshold calibration range")
+    thresholds = np.arange(minimum, maximum + step * 0.5, step, dtype=np.float64)
+    rows = [
+        detection_operating_point(
+            coco_payload,
+            records,
+            score_threshold=float(threshold),
+            iou_threshold=iou_threshold,
+        )
+        for threshold in thresholds
+    ]
+    # Prefer the stricter threshold when F1 is tied, producing a cleaner output.
+    selected = max(rows, key=lambda row: (float(row["f1"]), float(row["score_threshold"])))
+    report: dict[str, float | int | str] = {
+        "source": "validation",
+        "objective": "max_micro_f1",
+        **selected,
+        "search_min": float(minimum),
+        "search_max": float(maximum),
+        "search_step": float(step),
+    }
+    return report, rows
+
+
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return

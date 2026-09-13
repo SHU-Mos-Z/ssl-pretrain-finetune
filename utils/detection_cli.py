@@ -85,9 +85,18 @@ def add_conditioned_model_arguments(parser: argparse.ArgumentParser) -> None:
 
 def add_detection_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--detection-mode", choices=("anchor_based", "anchor_free"), default="anchor_based")
-    parser.add_argument("--det-feature-mode", choices=("z_pyramid", "gated_pyramid", "z_full"), default="z_pyramid")
+    parser.add_argument(
+        "--det-feature-mode",
+        choices=("z_pyramid", "gated_pyramid", "gated_fpn", "z_full"),
+        default="z_pyramid",
+    )
     parser.add_argument("--det-feature-dim", type=int, default=128)
     parser.add_argument("--head-depth", type=int, default=4)
+    parser.add_argument("--det-head-norm", choices=("none", "group_norm"), default="none")
+    parser.add_argument("--det-head-norm-groups", type=int, default=32)
+    parser.add_argument("--det-quality-mode", choices=("legacy", "iou"), default="legacy")
+    parser.add_argument("--quality-loss-weight", type=float, default=1.0)
+    parser.add_argument("--quality-score-power", type=float, default=0.5)
     parser.add_argument("--anchor-sizes", type=_float_tuple, default=(16.0, 32.0, 64.0, 128.0))
     parser.add_argument("--anchor-scales", type=_float_tuple, default=(1.0, 1.2599, 1.5874))
     parser.add_argument("--anchor-ratios", type=_float_tuple, default=(0.5, 1.0, 2.0))
@@ -119,7 +128,14 @@ def add_detection_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--box-loss-weight", type=float, default=1.0)
     parser.add_argument("--centerness-loss-weight", type=float, default=1.0)
     parser.add_argument("--prior-probability", type=float, default=0.01)
-    parser.add_argument("--score-threshold", type=float, default=0.05)
+    parser.add_argument(
+        "--score-threshold",
+        "--ap-score-threshold",
+        dest="score_threshold",
+        type=float,
+        default=0.05,
+        help="Low candidate floor used for COCO AP evaluation (legacy alias retained).",
+    )
     parser.add_argument("--nms-threshold", type=float, default=0.5)
     parser.add_argument("--pre-nms-topk", type=int, default=1000)
     parser.add_argument("--max-detections", type=int, default=100)
@@ -244,6 +260,11 @@ def detection_config_from_args(args: argparse.Namespace, num_classes: int) -> De
         num_classes=num_classes,
         det_feature_dim=args.det_feature_dim,
         head_depth=args.head_depth,
+        head_norm=args.det_head_norm,
+        head_norm_groups=args.det_head_norm_groups,
+        quality_mode=args.det_quality_mode,
+        quality_loss_weight=args.quality_loss_weight,
+        quality_score_power=args.quality_score_power,
         anchor_sizes=anchor_sizes,
         anchor_scales=anchor_scales,
         anchor_ratios=anchor_ratios,

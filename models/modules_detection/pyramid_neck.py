@@ -78,3 +78,41 @@ class GatedPyramidNeck(nn.Module):
         p3 = self.p3(decoder_stages["D3"])
         p4 = self.p4(decoder_stages["D4"])
         return OrderedDict(P2=p2, P3=p3, P4=p4, P5=self.p5(p4))
+
+
+class GatedFPNNeck(nn.Module):
+    """Top-down FPN over native gated-decoder D2-D4 stages.
+
+    This is intentionally separate from :class:`GatedPyramidNeck` so legacy
+    experiments retain byte-for-byte the same feature path and state dict.
+    """
+
+    def __init__(self, decoder_channels: int, out_channels: int):
+        super().__init__()
+        self.lateral2 = ConvNormAct(decoder_channels, out_channels, 1)
+        self.lateral3 = ConvNormAct(decoder_channels, out_channels, 1)
+        self.lateral4 = ConvNormAct(decoder_channels, out_channels, 1)
+        self.output2 = ConvNormAct(out_channels, out_channels, 3)
+        self.output3 = ConvNormAct(out_channels, out_channels, 3)
+        self.output4 = ConvNormAct(out_channels, out_channels, 3)
+        self.p5 = ConvNormAct(out_channels, out_channels, 3, stride=2)
+
+    def forward(
+        self, decoder_stages: dict[str, torch.Tensor]
+    ) -> OrderedDict[str, torch.Tensor]:
+        missing = {"D2", "D3", "D4"}.difference(decoder_stages)
+        if missing:
+            raise KeyError(f"gated decoder stages missing: {sorted(missing)}")
+        lateral4 = self.lateral4(decoder_stages["D4"])
+        lateral3 = self.lateral3(decoder_stages["D3"])
+        lateral2 = self.lateral2(decoder_stages["D2"])
+        merged3 = lateral3 + torch.nn.functional.interpolate(
+            lateral4, size=lateral3.shape[-2:], mode="nearest"
+        )
+        merged2 = lateral2 + torch.nn.functional.interpolate(
+            merged3, size=lateral2.shape[-2:], mode="nearest"
+        )
+        p4 = self.output4(lateral4)
+        p3 = self.output3(merged3)
+        p2 = self.output2(merged2)
+        return OrderedDict(P2=p2, P3=p3, P4=p4, P5=self.p5(p4))

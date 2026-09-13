@@ -165,6 +165,7 @@ DETECTION_CURVE_GROUPS = {
         ("train_loss_cls", "Classification loss"),
         ("train_loss_box", "Box loss"),
         ("train_loss_centerness", "Centerness loss"),
+        ("train_loss_quality", "Quality loss"),
     ),
     "detection_metrics": (
         ("val_ap50_95", "Val AP50:95"),

@@ -19,6 +19,11 @@ class DetectionConfig:
     num_classes: int = 1
     det_feature_dim: int = 128
     head_depth: int = 4
+    head_norm: str = "none"
+    head_norm_groups: int = 32
+    quality_mode: str = "legacy"
+    quality_loss_weight: float = 1.0
+    quality_score_power: float = 0.5
 
     anchor_sizes: tuple[float, ...] = (16.0, 32.0, 64.0, 128.0)
     anchor_scales: tuple[float, ...] = (1.0, 1.2599, 1.5874)
@@ -56,10 +61,20 @@ class DetectionConfig:
     def validate(self) -> None:
         if self.detection_mode not in {"anchor_based", "anchor_free"}:
             raise ValueError("detection_mode must be anchor_based or anchor_free")
-        if self.feature_mode not in {"z_pyramid", "gated_pyramid", "z_full"}:
+        if self.feature_mode not in {"z_pyramid", "gated_pyramid", "gated_fpn", "z_full"}:
             raise ValueError("invalid feature_mode")
         if self.num_classes < 1 or self.det_feature_dim < 1 or self.head_depth < 1:
             raise ValueError("num_classes, det_feature_dim and head_depth must be positive")
+        if self.head_norm not in {"none", "group_norm"}:
+            raise ValueError("head_norm must be none or group_norm")
+        if self.head_norm_groups < 1:
+            raise ValueError("head_norm_groups must be positive")
+        if self.quality_mode not in {"legacy", "iou"}:
+            raise ValueError("quality_mode must be legacy or iou")
+        if self.quality_loss_weight < 0:
+            raise ValueError("quality_loss_weight must be non-negative")
+        if not 0.0 <= self.quality_score_power <= 1.0:
+            raise ValueError("quality_score_power must be in [0,1]")
         if not self.anchor_sizes or not self.anchor_scales or not self.anchor_ratios:
             raise ValueError("anchor configuration cannot be empty")
         if any(value <= 0 for value in (*self.anchor_sizes, *self.anchor_scales, *self.anchor_ratios)):

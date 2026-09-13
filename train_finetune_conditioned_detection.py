@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import contextlib
 import json
 import math
@@ -19,6 +20,7 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
+from models.detection_contracts import DetectionConfig
 from models.finetune_model_conditioned_detection import ConditionedDetectionModel
 from utils.datasets.conditioned_detection_dataset import build_conditioned_detection_loaders
 from utils.datasets.detection_view_geometry import DetectionViewConfig
@@ -33,6 +35,7 @@ from utils.detection_cli import (
     model_config_from_args,
 )
 from utils.detection_postprocess import DetectionPostProcessor
+from utils.detection_metrics import calibrate_score_threshold
 from utils.detection_runtime import (
     distributed_context,
     evaluate_detection_model,
@@ -103,6 +106,32 @@ def get_args() -> argparse.Namespace:
         help="Save a validation COCO PR curve every N epochs; <=0 disables it.",
     )
     parser.add_argument(
+        "--test-visualization-samples",
+        type=int,
+        default=12,
+        help=(
+            "Save prediction/GT overlays for this many test images after evaluating "
+            "ckpt_best.pth; <=0 disables test visualization."
+        ),
+    )
+    parser.add_argument(
+        "--deployment-score-threshold",
+        type=float,
+        default=None,
+        help="Manual deployment threshold; omitted means calibrate maximum F1 on validation.",
+    )
+    parser.add_argument(
+        "--visualization-score-threshold",
+        type=float,
+        default=None,
+        help="Visualization-only threshold; defaults to the deployment threshold.",
+    )
+    parser.add_argument("--visualization-max-detections", type=int, default=30)
+    parser.add_argument("--threshold-calibration-iou", type=float, default=0.5)
+    parser.add_argument("--threshold-search-min", type=float, default=0.05)
+    parser.add_argument("--threshold-search-max", type=float, default=0.90)
+    parser.add_argument("--threshold-search-step", type=float, default=0.01)
+    parser.add_argument(
         "--progress", choices=("tqdm", "log", "none"), default="log"
     )
     parser.add_argument("--log-interval", type=int, default=10)
@@ -133,6 +162,20 @@ def get_args() -> argparse.Namespace:
         parser.error("--gradient-accumulation-steps must be positive")
     if args.pr_curve_interval < 0:
         parser.error("--pr-curve-interval must be non-negative")
+    if args.test_visualization_samples < 0:
+        parser.error("--test-visualization-samples must be non-negative")
+    for name in ("deployment_score_threshold", "visualization_score_threshold"):
+        value = getattr(args, name)
+        if value is not None and not 0 <= value <= 1:
+            parser.error(f"--{name.replace('_', '-')} must be in [0,1]")
+    if args.visualization_max_detections < 1:
+        parser.error("--visualization-max-detections must be positive")
+    if not 0 < args.threshold_calibration_iou <= 1:
+        parser.error("--threshold-calibration-iou must be in (0,1]")
+    if not 0 <= args.threshold_search_min <= args.threshold_search_max <= 1:
+        parser.error("score-threshold search bounds must satisfy 0 <= min <= max <= 1")
+    if args.threshold_search_step <= 0:
+        parser.error("--threshold-search-step must be positive")
     if args.evaluation_interval < 1:
         parser.error("--evaluation-interval must be positive")
     if args.prefetch_factor < 1:
@@ -157,6 +200,7 @@ def _checkpoint_payload(
     detection_config,
     dataset,
     args,
+    threshold_calibration,
 ) -> dict:
     return {
         "model": _unwrap(model).state_dict(),
@@ -171,7 +215,17 @@ def _checkpoint_payload(
         "category_id_to_label": dataset.category_id_to_label,
         "category_names": dataset.category_names,
         "args": vars(args),
+        "threshold_calibration": threshold_calibration,
     }
+
+
+def _write_threshold_sweep(path: Path, rows: list[dict]) -> None:
+    if not rows:
+        return
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _reduce_epoch_totals(values: torch.Tensor, distributed: bool) -> torch.Tensor:
@@ -247,7 +301,12 @@ def main() -> None:
         saved_detection_config = resume_state.get("detection_config")
         if saved_model_config != asdict(model_config):
             raise ValueError("resume checkpoint model_config differs from current arguments")
-        if saved_detection_config != detection_config.to_dict():
+        normalized_saved_detection_config = (
+            DetectionConfig.from_dict(saved_detection_config).to_dict()
+            if saved_detection_config is not None
+            else None
+        )
+        if normalized_saved_detection_config != detection_config.to_dict():
             raise ValueError("resume checkpoint detection_config differs from current arguments")
         saved_view_config = DetectionViewConfig.from_dict(
             resume_state.get("view_config", {"view_mode": "direct"})
@@ -318,6 +377,7 @@ def main() -> None:
     postprocessor = DetectionPostProcessor(detection_config)
 
     start_epoch, best_ap = 1, -1.0
+    best_threshold_calibration = None
     if resume_state is not None:
         inner.load_state_dict(resume_state["model"])
         optimizer.load_state_dict(resume_state["optimizer"])
@@ -326,6 +386,7 @@ def main() -> None:
             scaler.load_state_dict(resume_state["scaler"])
         start_epoch = int(resume_state["epoch"]) + 1
         best_ap = float(resume_state.get("best_ap50_95", -1.0))
+        best_threshold_calibration = resume_state.get("threshold_calibration")
 
     if rank == 0:
         resolved = {
@@ -389,7 +450,9 @@ def main() -> None:
         train_loader.dataset.set_epoch(epoch)
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        totals = torch.zeros(8, dtype=torch.float64, device=device)
+        # total, classification, box, centerness, quality, positive,
+        # negative, ignored, number of samples
+        totals = torch.zeros(9, dtype=torch.float64, device=device)
         epoch_start = time.time()
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
@@ -447,10 +510,14 @@ def main() -> None:
                 totals[3].add_(
                     losses["loss_centerness"].detach().to(torch.float64), alpha=batch_size
                 )
-            totals[4].add_(losses["num_positive"].detach().to(torch.float64))
-            totals[5].add_(losses["num_negative"].detach().to(torch.float64))
-            totals[6].add_(losses["num_ignored"].detach().to(torch.float64))
-            totals[7] += batch_size
+            if "loss_quality" in losses:
+                totals[4].add_(
+                    losses["loss_quality"].detach().to(torch.float64), alpha=batch_size
+                )
+            totals[5].add_(losses["num_positive"].detach().to(torch.float64))
+            totals[6].add_(losses["num_negative"].detach().to(torch.float64))
+            totals[7].add_(losses["num_ignored"].detach().to(torch.float64))
+            totals[8] += batch_size
             if (
                 args.progress == "log"
                 and rank == 0
@@ -466,13 +533,14 @@ def main() -> None:
                 )
         totals = _reduce_epoch_totals(totals, distributed)
         train_metrics = {
-            "loss_total": float(totals[0] / totals[7].clamp(min=1)),
-            "loss_cls": float(totals[1] / totals[7].clamp(min=1)),
-            "loss_box": float(totals[2] / totals[7].clamp(min=1)),
-            "loss_centerness": float(totals[3] / totals[7].clamp(min=1)),
-            "num_positive": int(totals[4]),
-            "num_negative": int(totals[5]),
-            "num_ignored": int(totals[6]),
+            "loss_total": float(totals[0] / totals[8].clamp(min=1)),
+            "loss_cls": float(totals[1] / totals[8].clamp(min=1)),
+            "loss_box": float(totals[2] / totals[8].clamp(min=1)),
+            "loss_centerness": float(totals[3] / totals[8].clamp(min=1)),
+            "loss_quality": float(totals[4] / totals[8].clamp(min=1)),
+            "num_positive": int(totals[5]),
+            "num_negative": int(totals[6]),
+            "num_ignored": int(totals[7]),
         }
         perform_evaluation = (
             epoch == start_epoch
@@ -480,6 +548,7 @@ def main() -> None:
             or epoch % args.evaluation_interval == 0
         )
         val_metrics = None
+        validation_calibration = None
         improved = False
         if perform_evaluation:
             save_pr_curve = (
@@ -503,9 +572,38 @@ def main() -> None:
             )
             current_ap = float(val_metrics["AP50_95"])
             improved = current_ap > best_ap or best_ap < 0
+            if rank == 0:
+                prediction_path = save_dir / "validation_latest" / "predictions_coco.json"
+                prediction_records = json.loads(prediction_path.read_text(encoding="utf-8"))
+                validation_calibration, threshold_rows = calibrate_score_threshold(
+                    val_loader.dataset.source_coco,
+                    prediction_records,
+                    minimum=args.threshold_search_min,
+                    maximum=args.threshold_search_max,
+                    step=args.threshold_search_step,
+                    iou_threshold=args.threshold_calibration_iou,
+                )
+                validation_calibration["epoch"] = int(epoch)
+                automatic_threshold = float(validation_calibration["score_threshold"])
+                validation_calibration["automatic_score_threshold"] = automatic_threshold
+                validation_calibration["deployment_score_threshold"] = float(
+                    args.deployment_score_threshold
+                    if args.deployment_score_threshold is not None
+                    else automatic_threshold
+                )
+                calibration_dir = save_dir / "validation_latest"
+                (calibration_dir / "threshold_calibration.json").write_text(
+                    json.dumps(validation_calibration, indent=2), encoding="utf-8"
+                )
+                _write_threshold_sweep(calibration_dir / "threshold_sweep.csv", threshold_rows)
             if improved:
                 best_ap = current_ap
                 no_improve = 0
+                if rank == 0:
+                    best_threshold_calibration = validation_calibration
+                    (save_dir / "threshold_calibration_best.json").write_text(
+                        json.dumps(best_threshold_calibration, indent=2), encoding="utf-8"
+                    )
             else:
                 no_improve += 1
         if rank == 0:
@@ -520,6 +618,7 @@ def main() -> None:
                 detection_config,
                 train_loader.dataset,
                 args,
+                best_threshold_calibration,
             )
             torch.save(payload, save_dir / "ckpt_last.pth")
             if improved:
@@ -548,6 +647,7 @@ def main() -> None:
                 "train_loss_cls": train_metrics["loss_cls"],
                 "train_loss_box": train_metrics["loss_box"],
                 "train_loss_centerness": train_metrics["loss_centerness"],
+                "train_loss_quality": train_metrics["loss_quality"],
                 "num_positive": train_metrics["num_positive"],
                 "num_negative": train_metrics["num_negative"],
                 "num_ignored": train_metrics["num_ignored"],
@@ -588,6 +688,17 @@ def main() -> None:
     if test_loader is not None:
         best_state = torch.load(save_dir / "ckpt_best.pth", map_location="cpu", weights_only=False)
         _unwrap(model).load_state_dict(best_state["model"])
+        saved_calibration = best_state.get("threshold_calibration") or {}
+        deployment_threshold = float(
+            args.deployment_score_threshold
+            if args.deployment_score_threshold is not None
+            else saved_calibration.get("deployment_score_threshold", args.score_threshold)
+        )
+        visualization_threshold = float(
+            args.visualization_score_threshold
+            if args.visualization_score_threshold is not None
+            else deployment_threshold
+        )
         test_metrics = evaluate_detection_model(
             model,
             test_loader,
@@ -597,6 +708,10 @@ def main() -> None:
             distributed=distributed,
             rank=rank,
             output_dir=save_dir / "test_best" if rank == 0 else None,
+            visualization_samples=args.test_visualization_samples,
+            visualization_score_threshold=visualization_threshold,
+            visualization_max_detections=args.visualization_max_detections,
+            deployment_score_threshold=deployment_threshold,
             max_batches=args.max_eval_batches,
         )
         if rank == 0:

@@ -66,3 +66,23 @@ def test_invalid_anchor_config_json_has_contextual_error(tmp_path):
 
     with pytest.raises(ValueError, match="invalid anchor config JSON"):
         detection_config_from_args(args, num_classes=1)
+
+
+def test_fpn_group_norm_quality_cli_contract():
+    args = _detection_args(
+        "--det-feature-mode", "gated_fpn",
+        "--det-head-norm", "group_norm",
+        "--det-head-norm-groups", "16",
+        "--det-quality-mode", "iou",
+        "--quality-loss-weight", "0.75",
+        "--quality-score-power", "0.6",
+        "--ap-score-threshold", "0.02",
+    )
+    config = detection_config_from_args(args, num_classes=1)
+    assert config.feature_mode == "gated_fpn"
+    assert config.head_norm == "group_norm"
+    assert config.head_norm_groups == 16
+    assert config.quality_mode == "iou"
+    assert config.quality_loss_weight == pytest.approx(0.75)
+    assert config.quality_score_power == pytest.approx(0.6)
+    assert config.score_threshold == pytest.approx(0.02)

@@ -30,10 +30,18 @@ class DetectionPostProcessor:
 
     def _anchor_image(self, output: dict, index: int, image_size: tuple[int, int]):
         boxes, scores, labels = [], [], []
-        for anchors, logits, deltas in zip(
+        for level_index, (anchors, logits, deltas) in enumerate(zip(
             output["anchors"], output["cls_logits"], output["bbox_deltas"]
-        ):
-            probabilities = logits[index].float().sigmoid().flatten()
+        )):
+            class_probabilities = logits[index].float().sigmoid()
+            if self.config.quality_mode == "iou":
+                quality = output["quality_logits"][level_index][index].float().sigmoid()[:, None]
+                power = self.config.quality_score_power
+                class_probabilities = (
+                    class_probabilities.clamp(min=1e-8).pow(1.0 - power)
+                    * quality.clamp(min=1e-8).pow(power)
+                )
+            probabilities = class_probabilities.flatten()
             keep = torch.where(probabilities >= self.config.score_threshold)[0]
             if len(keep) > self.config.pre_nms_topk:
                 _, order = probabilities[keep].topk(self.config.pre_nms_topk)
@@ -49,17 +57,31 @@ class DetectionPostProcessor:
 
     def _fcos_image(self, output: dict, index: int, image_size: tuple[int, int]):
         boxes, scores, labels = [], [], []
-        for points, point_strides, logits, regression, centerness in zip(
+        centerness_levels = output.get("centerness_logits", [None] * len(output["points"]))
+        quality_levels = output.get("quality_logits", [None] * len(output["points"]))
+        for points, point_strides, logits, regression, centerness, quality in zip(
             output["points"],
             output["point_strides"],
             output["cls_logits"],
             output["bbox_regression"],
-            output["centerness_logits"],
+            centerness_levels,
+            quality_levels,
         ):
-            probabilities = torch.sqrt(
-                logits[index].float().sigmoid()
-                * centerness[index].float().sigmoid()[:, None]
-            ).flatten()
+            class_probabilities = logits[index].float().sigmoid()
+            auxiliary = centerness if centerness is not None else quality
+            if auxiliary is None:
+                raise KeyError("FCOS output lacks centerness/quality logits")
+            auxiliary_probability = auxiliary[index].float().sigmoid()[:, None]
+            if centerness is not None:
+                probabilities = torch.sqrt(
+                    class_probabilities * auxiliary_probability
+                ).flatten()
+            else:
+                power = self.config.quality_score_power
+                probabilities = (
+                    class_probabilities.clamp(min=1e-8).pow(1.0 - power)
+                    * auxiliary_probability.clamp(min=1e-8).pow(power)
+                ).flatten()
             keep = torch.where(probabilities >= self.config.score_threshold)[0]
             if len(keep) > self.config.pre_nms_topk:
                 _, order = probabilities[keep].topk(self.config.pre_nms_topk)

@@ -13,9 +13,9 @@ export NUM_GPUS="${NUM_GPUS:-2}"
 export BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-8}"
 export LR="${LR:-8e-4}"
 export PRETRAIN_CKPT="${PRETRAIN_CKPT:-records/pretrain_conditioned/20260817_005610/ckpt_last.pth}"
-export TRAIN_ROOT="${TRAIN_ROOT:-data/GPCC_detection_patch_512x640_overlap_0x0_to_256x256_connected_component_c8_minmax_finetune_test_p014_20260910}"
-export VAL_ROOT="${VAL_ROOT:-data/GPCC_detection_patch_512x640_overlap_0x0_to_256x256_connected_component_c8_minmax_finetune_train_p072_20260910}"
-export TEST_ROOT="${TEST_ROOT:-data/GPCC_detection_patch_512x640_overlap_0x0_to_256x256_connected_component_c8_minmax_finetune_val_p014_20260910}"
+export TRAIN_ROOT="${TRAIN_ROOT:-data/GPCC_detection_patch_512x640_overlap_0x0_to_256x256_connected_component_c8_minmax_finetune_train_p072_20260910}"
+export VAL_ROOT="${VAL_ROOT:-data/GPCC_detection_patch_512x640_overlap_0x0_to_256x256_connected_component_c8_minmax_finetune_val_p014_20260910}"
+export TEST_ROOT="${TEST_ROOT:-data/GPCC_detection_patch_512x640_overlap_0x0_to_256x256_connected_component_c8_minmax_finetune_test_p014_20260910}"
 
 EXPERIMENT_SCRIPTS=(
     "$SCRIPT_DIR/00_gpcc_direct256_fcos_gated.sh"

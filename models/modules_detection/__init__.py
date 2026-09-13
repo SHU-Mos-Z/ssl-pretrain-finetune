@@ -4,6 +4,7 @@ from .anchor_generator import AnchorGenerator
 from .box_coder import BoxCoder
 from .box_ops import (
     batched_nms,
+    aligned_box_iou,
     box_area,
     box_ioa,
     box_iou,
@@ -16,7 +17,7 @@ from .fcos_assigner import FCOSPointAssigner
 from .fcos_head import FCOSHead
 from .matcher import AnchorMatcher
 from .point_generator import PointGenerator
-from .pyramid_neck import GatedPyramidNeck, ZFullNeck, ZPyramidNeck
+from .pyramid_neck import GatedFPNNeck, GatedPyramidNeck, ZFullNeck, ZPyramidNeck
 from .retinanet_head import RetinaNetHead
 
 __all__ = [
@@ -26,11 +27,13 @@ __all__ = [
     "FCOSHead",
     "FCOSPointAssigner",
     "GatedPyramidNeck",
+    "GatedFPNNeck",
     "PointGenerator",
     "RetinaNetHead",
     "ZFullNeck",
     "ZPyramidNeck",
     "batched_nms",
+    "aligned_box_iou",
     "box_area",
     "box_ioa",
     "box_iou",

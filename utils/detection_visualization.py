@@ -62,6 +62,8 @@ def render_detection_examples(
     prediction_records: list[dict[str, Any]],
     output_dir: str | Path,
     max_samples: int = 12,
+    prediction_score_threshold: float = 0.0,
+    max_predictions_per_image: int | None = None,
 ) -> None:
     if max_samples <= 0:
         return
@@ -95,7 +97,18 @@ def render_detection_examples(
         ]
         ordinary_boxes = np.asarray([_xywh_to_xyxy(item["bbox"]) for item in ordinary], dtype=np.float32).reshape(-1, 4)
         matched: set[int] = set()
-        for prediction in sorted(pred_by_image[image_id], key=lambda item: item["score"], reverse=True):
+        predictions = sorted(
+            (
+                item
+                for item in pred_by_image[image_id]
+                if float(item["score"]) >= float(prediction_score_threshold)
+            ),
+            key=lambda item: item["score"],
+            reverse=True,
+        )
+        if max_predictions_per_image is not None:
+            predictions = predictions[: int(max_predictions_per_image)]
+        for prediction in predictions:
             box = _xywh_to_xyxy(prediction["bbox"])
             ious = _iou(box, ordinary_boxes)
             candidate = int(ious.argmax()) if len(ious) else -1

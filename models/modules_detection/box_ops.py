@@ -21,6 +21,18 @@ def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
     return intersection / union.clamp(min=1e-7)
 
 
+def aligned_box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """Element-wise IoU for two aligned ``(N,4)`` box tensors."""
+
+    if boxes1.shape != boxes2.shape or boxes1.ndim != 2 or boxes1.shape[1] != 4:
+        raise ValueError("aligned IoU requires matching (N,4) tensors")
+    left_top = torch.maximum(boxes1[:, :2], boxes2[:, :2])
+    right_bottom = torch.minimum(boxes1[:, 2:], boxes2[:, 2:])
+    intersection = (right_bottom - left_top).clamp(min=0).prod(dim=1)
+    union = box_area(boxes1) + box_area(boxes2) - intersection
+    return intersection / union.clamp(min=1e-7)
+
+
 def box_ioa(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
     """Intersection divided by area of ``boxes1``."""
 

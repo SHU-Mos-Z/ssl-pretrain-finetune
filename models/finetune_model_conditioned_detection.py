@@ -15,6 +15,7 @@ from models.endmember_conditioned_pretrain_model import EndmemberConditionedPret
 from models.modules_detection import (
     AnchorGenerator,
     FCOSHead,
+    GatedFPNNeck,
     GatedPyramidNeck,
     PointGenerator,
     RetinaNetHead,
@@ -45,20 +46,26 @@ class ConditionedDetectionModel(nn.Module):
         self.backbone.abundance_head.requires_grad_(False)
         self.backbone.token_reconstruction_head.requires_grad_(False)
 
-        if detection_config.feature_mode == "gated_pyramid" and model_config.patch_size < 16:
+        if detection_config.feature_mode in {"gated_pyramid", "gated_fpn"} and model_config.patch_size < 16:
             raise ValueError(
-                "gated_pyramid requires patch_size>=16 so decoder stages D2-D4 exist"
+                "gated decoder pyramids require patch_size>=16 so decoder stages D2-D4 exist"
             )
         if detection_config.feature_mode == "z_full":
             self.neck = ZFullNeck(model_config.feature_dim, detection_config.det_feature_dim)
         elif detection_config.feature_mode == "z_pyramid":
             self.neck = ZPyramidNeck(model_config.feature_dim, detection_config.det_feature_dim)
-        else:
+        elif detection_config.feature_mode == "gated_pyramid":
             self.neck = GatedPyramidNeck(
                 model_config.decoder_mid_ch, detection_config.det_feature_dim
             )
             # gated_pyramid stops after D2; D1, D0 and the final Z projection are
             # intentionally outside this feature path and must not confuse DDP.
+            self.backbone.feature_decoder.blocks[-2:].requires_grad_(False)
+            self.backbone.feature_decoder.output.requires_grad_(False)
+        else:
+            self.neck = GatedFPNNeck(
+                model_config.decoder_mid_ch, detection_config.det_feature_dim
+            )
             self.backbone.feature_decoder.blocks[-2:].requires_grad_(False)
             self.backbone.feature_decoder.output.requires_grad_(False)
 
@@ -75,6 +82,9 @@ class ConditionedDetectionModel(nn.Module):
                 detection_config.anchors_per_location,
                 detection_config.head_depth,
                 detection_config.prior_probability,
+                detection_config.head_norm,
+                detection_config.head_norm_groups,
+                detection_config.quality_mode,
             )
         else:
             self.geometry_generator = PointGenerator(detection_config.anchor_offset)
@@ -84,6 +94,9 @@ class ConditionedDetectionModel(nn.Module):
                 len(detection_config.feature_names),
                 detection_config.head_depth,
                 detection_config.prior_probability,
+                detection_config.head_norm,
+                detection_config.head_norm_groups,
+                detection_config.quality_mode,
             )
 
         if pretrain_ckpt:
@@ -138,12 +151,12 @@ class ConditionedDetectionModel(nn.Module):
         return self
 
     def _feature_maps(self, output: dict[str, Any]) -> OrderedDict[str, torch.Tensor]:
-        if self.detection_config.feature_mode == "gated_pyramid":
+        if self.detection_config.feature_mode in {"gated_pyramid", "gated_fpn"}:
             return self.neck(output["decoder_stages"])
         return self.neck(output["features"])
 
     def forward(self, batch: dict[str, Any]) -> dict[str, Any]:
-        need_stages = self.detection_config.feature_mode == "gated_pyramid"
+        need_stages = self.detection_config.feature_mode in {"gated_pyramid", "gated_fpn"}
         backbone_output = self.backbone.forward_features(
             batch,
             return_decoder_stages=need_stages,

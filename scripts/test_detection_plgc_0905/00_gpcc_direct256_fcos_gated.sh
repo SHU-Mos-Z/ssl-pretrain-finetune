@@ -83,6 +83,7 @@ WORKERS=2
 SAVE_INTERVAL=10
 EVALUATION_INTERVAL=5
 PR_CURVE_INTERVAL=5
+TEST_VISUALIZATION_SAMPLES="${TEST_VISUALIZATION_SAMPLES:-12}"
 PROGRESS="log"
 LOG_INTERVAL=10
 
@@ -146,7 +147,9 @@ OMP_NUM_THREADS=2 torchrun --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_P
     --weight-decay "$WEIGHT_DECAY" --warmup-epochs "$WARMUP_EPOCHS" \
     --clip-grad "$CLIP_GRAD" --workers "$WORKERS" --seed "$SEED" \
     --save-interval "$SAVE_INTERVAL" --evaluation-interval "$EVALUATION_INTERVAL" \
-    --pr-curve-interval "$PR_CURVE_INTERVAL" --progress "$PROGRESS" --log-interval "$LOG_INTERVAL" \
+    --pr-curve-interval "$PR_CURVE_INTERVAL" \
+    --test-visualization-samples "$TEST_VISUALIZATION_SAMPLES" \
+    --progress "$PROGRESS" --log-interval "$LOG_INTERVAL" \
     --patch-size "$PATCH_SIZE" --spectral-patch-size "$SPECTRAL_PATCH_SIZE" \
     --embed-dim "$EMBED_DIM" --vit-depth "$VIT_DEPTH" --vit-heads "$VIT_HEADS" \
     --mlp-ratio "$MLP_RATIO" --dropout "$DROPOUT" --cnn-stem-ch "$CNN_STEM_CH" \

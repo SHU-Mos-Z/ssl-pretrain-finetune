@@ -17,7 +17,7 @@ from utils.datasets.conditioned_detection_dataset import (
     ConditionedDetectionDataset,
     conditioned_detection_collate,
 )
-from utils.detection_metrics import evaluate_coco_detections
+from utils.detection_metrics import calibrate_score_threshold, evaluate_coco_detections
 from utils.detection_postprocess import DetectionPostProcessor
 from utils.detection_runtime import merge_source_detections
 from utils.datasets.detection_view_geometry import (
@@ -87,7 +87,7 @@ def test_box_coder_round_trip():
 
 
 @pytest.mark.parametrize("detection_mode", ["anchor_based", "anchor_free"])
-@pytest.mark.parametrize("feature_mode", ["z_full", "z_pyramid", "gated_pyramid"])
+@pytest.mark.parametrize("feature_mode", ["z_full", "z_pyramid", "gated_pyramid", "gated_fpn"])
 @pytest.mark.parametrize("image_size", [(64, 80), (64, 64)])
 def test_all_detection_modes_are_dynamic_and_differentiable(
     detection_mode: str, feature_mode: str, image_size: tuple[int, int]
@@ -119,6 +119,33 @@ def test_all_detection_modes_are_dynamic_and_differentiable(
         (math.ceil(height / 32), math.ceil(width / 32)),
     )
     assert output["feature_shapes"] == expected
+
+
+@pytest.mark.parametrize("detection_mode", ["anchor_based", "anchor_free"])
+def test_gated_fpn_group_norm_iou_quality_is_differentiable(detection_mode: str):
+    config = DetectionConfig(
+        detection_mode=detection_mode,
+        feature_mode="gated_fpn",
+        num_classes=1,
+        det_feature_dim=8,
+        head_depth=1,
+        head_norm="group_norm",
+        head_norm_groups=4,
+        quality_mode="iou",
+        anchor_sizes=(8, 16, 32, 64),
+        anchor_scales=(1.0,),
+        anchor_ratios=(1.0,),
+        pre_nms_topk=20,
+        max_detections=10,
+    )
+    model = ConditionedDetectionModel(_model_config(), config)
+    output = model(_batch(64, 80))
+    assert "quality_logits" in output
+    losses = DetectionCriterion(config)(output, [_target(64, 80)])
+    assert torch.isfinite(losses["loss_total"])
+    assert torch.isfinite(losses["loss_quality"])
+    losses["loss_total"].backward()
+    assert DetectionPostProcessor(config)(output)[0]["boxes"].shape[1:] == (4,)
 
 
 @pytest.mark.parametrize("annotation_layout", ("monolithic", "fragments"))
@@ -203,6 +230,26 @@ def test_coco_metrics_accept_custom_ignore(tmp_path):
     assert metrics["AP50_95"] == pytest.approx(1.0)
     assert pr_curve_path.is_file()
     assert pr_curve_path.with_suffix(".csv").is_file()
+
+
+def test_validation_score_threshold_calibration_prefers_clean_operating_point():
+    coco = {
+        "images": [{"id": 1, "width": 64, "height": 64, "file_name": "x.npy"}],
+        "annotations": [
+            {"id": 1, "image_id": 1, "category_id": 1, "bbox": [10, 10, 20, 20], "area": 400, "iscrowd": 0}
+        ],
+        "categories": [{"id": 1, "name": "lesion"}],
+    }
+    records = [
+        {"image_id": 1, "category_id": 1, "bbox": [10, 10, 20, 20], "score": 0.8},
+        {"image_id": 1, "category_id": 1, "bbox": [40, 40, 10, 10], "score": 0.2},
+    ]
+    report, rows = calibrate_score_threshold(
+        coco, records, minimum=0.1, maximum=0.9, step=0.1
+    )
+    assert rows
+    assert report["f1"] == pytest.approx(1.0)
+    assert 0.2 < report["score_threshold"] <= 0.8
 
 
 def test_group_aware_detection_split_keeps_sources_together():

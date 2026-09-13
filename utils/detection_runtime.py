@@ -13,6 +13,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from utils.detection_metrics import evaluate_coco_detections
 from utils.detection_metrics import detections_to_coco
+from utils.detection_metrics import detection_operating_point, filter_prediction_records
 from utils.detection_postprocess import DetectionPostProcessor
 from utils.detection_visualization import render_detection_examples
 from models.modules_detection.box_ops import box_iou, sample_mask_at_points
@@ -178,6 +179,9 @@ def evaluate_detection_model(
     rank: int,
     output_dir: str | Path | None = None,
     visualization_samples: int = 0,
+    visualization_score_threshold: float = 0.0,
+    visualization_max_detections: int | None = None,
+    deployment_score_threshold: float | None = None,
     pr_curve_path: str | Path | None = None,
     max_batches: int = 0,
 ) -> dict[str, Any]:
@@ -276,6 +280,29 @@ def evaluate_detection_model(
                 prediction_records,
                 output_path / "visualizations",
                 visualization_samples,
+                prediction_score_threshold=visualization_score_threshold,
+                max_predictions_per_image=visualization_max_detections,
+            )
+        if output_path is not None and deployment_score_threshold is not None:
+            prediction_records = detections_to_coco(
+                gathered, dataset.label_to_category_id
+            )
+            deployed = filter_prediction_records(
+                prediction_records,
+                deployment_score_threshold,
+                visualization_max_detections,
+            )
+            (output_path / "predictions_deployment.json").write_text(
+                json.dumps(deployed, indent=2), encoding="utf-8"
+            )
+            operating_point = detection_operating_point(
+                dataset.source_coco,
+                prediction_records,
+                score_threshold=deployment_score_threshold,
+                max_detections_per_image=visualization_max_detections,
+            )
+            (output_path / "operating_point_metrics.json").write_text(
+                json.dumps(operating_point, indent=2), encoding="utf-8"
             )
         if output_path is not None and runtime_window:
             (output_path / "evaluation_view_manifest.json").write_text(

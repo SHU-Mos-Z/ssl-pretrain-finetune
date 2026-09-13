@@ -9,10 +9,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _tower(channels: int, depth: int) -> nn.Sequential:
+def _group_count(channels: int, requested: int) -> int:
+    for groups in range(min(channels, requested), 0, -1):
+        if channels % groups == 0 and channels // groups >= 2:
+            return groups
+    return 1
+
+
+def _tower(channels: int, depth: int, norm: str, norm_groups: int) -> nn.Sequential:
     layers: list[nn.Module] = []
     for _ in range(depth):
-        layers.extend((nn.Conv2d(channels, channels, 3, padding=1), nn.ReLU(inplace=True)))
+        convolution = nn.Conv2d(
+            channels, channels, 3, padding=1, bias=norm == "none"
+        )
+        layers.append(convolution)
+        if norm == "group_norm":
+            layers.append(nn.GroupNorm(_group_count(channels, norm_groups), channels))
+        layers.append(nn.ReLU(inplace=True))
     return nn.Sequential(*layers)
 
 
@@ -33,14 +46,23 @@ class FCOSHead(nn.Module):
         num_levels: int,
         depth: int = 4,
         prior_probability: float = 0.01,
+        norm: str = "none",
+        norm_groups: int = 32,
+        quality_mode: str = "legacy",
     ):
         super().__init__()
         self.num_classes = num_classes
-        self.cls_tower = _tower(channels, depth)
-        self.box_tower = _tower(channels, depth)
+        self.quality_mode = quality_mode
+        self.cls_tower = _tower(channels, depth, norm, norm_groups)
+        self.box_tower = _tower(channels, depth, norm, norm_groups)
         self.cls_logits = nn.Conv2d(channels, num_classes, 3, padding=1)
         self.bbox_regression = nn.Conv2d(channels, 4, 3, padding=1)
-        self.centerness = nn.Conv2d(channels, 1, 3, padding=1)
+        if quality_mode == "legacy":
+            self.centerness = nn.Conv2d(channels, 1, 3, padding=1)
+            self.quality = None
+        else:
+            self.centerness = None
+            self.quality = nn.Conv2d(channels, 1, 3, padding=1)
         self.scales = nn.ModuleList(Scale() for _ in range(num_levels))
         self._initialize(prior_probability)
 
@@ -57,6 +79,7 @@ class FCOSHead(nn.Module):
         all_logits: list[torch.Tensor] = []
         all_regression: list[torch.Tensor] = []
         all_centerness: list[torch.Tensor] = []
+        all_quality: list[torch.Tensor] = []
         for feature, scale in zip(features, self.scales):
             b, _, h, w = feature.shape
             cls_feature = self.cls_tower(feature)
@@ -64,12 +87,20 @@ class FCOSHead(nn.Module):
             logits = self.cls_logits(cls_feature).permute(0, 2, 3, 1).reshape(b, -1, self.num_classes)
             regression = F.relu(scale(self.bbox_regression(box_feature)))
             regression = regression.permute(0, 2, 3, 1).reshape(b, -1, 4)
-            centerness = self.centerness(box_feature).permute(0, 2, 3, 1).reshape(b, -1)
             all_logits.append(logits)
             all_regression.append(regression)
-            all_centerness.append(centerness)
-        return {
+            if self.centerness is not None:
+                centerness = self.centerness(box_feature).permute(0, 2, 3, 1).reshape(b, -1)
+                all_centerness.append(centerness)
+            if self.quality is not None:
+                quality = self.quality(box_feature).permute(0, 2, 3, 1).reshape(b, -1)
+                all_quality.append(quality)
+        output = {
             "cls_logits": all_logits,
             "bbox_regression": all_regression,
-            "centerness_logits": all_centerness,
         }
+        if all_centerness:
+            output["centerness_logits"] = all_centerness
+        if all_quality:
+            output["quality_logits"] = all_quality
+        return output

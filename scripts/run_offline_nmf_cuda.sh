@@ -82,7 +82,8 @@ cd "$(dirname "$0")/.."
 # DATA_ROOT="${DATA_ROOT:-data/2018WBC_cellcrop_512x512_noresize_contiguous20_entropy_multicandidate_manualoverride_filtered_minmax_20260830/L}"
 # DATA_ROOT="${DATA_ROOT:-data/2018WBC_cellcrop_512x512_noresize_contiguous20_entropy_multicandidate_manualoverride_filtered_minmax_20260830/M}"
 # DATA_ROOT="${DATA_ROOT:-data/2018WBC_cellcrop_512x512_noresize_contiguous20_entropy_multicandidate_manualoverride_filtered_minmax_20260830/N}"
-DATA_ROOT="${DATA_ROOT:-data/2018WBC_detection_scene_1300x1800_noresize_contiguous20_b28to47_refcropminmax_20260902_1725}"
+# DATA_ROOT="${DATA_ROOT:-/home/zsq/processed_data/DFS3R-main/data/GPCC_detection_patch_512x640_overlap_0x0_to_256x320_connected_component_c8_minmax_20260913}"
+DATA_ROOT="${DATA_ROOT:-/home/zsq/214DataA/zsq/DFS3R-main/data/GPCC_detection_patch_512x640_overlap_0x0_native_resolution_connected_component_c8_minmax_20260913}"
 # DATA_ROOT="${DATA_ROOT:-data/2018WBC_cellcrop_512x512_to_256x256_first50bands_multicandidate_manualoverride_filtered_minmax_20260903_1455/B}"
 # DATA_ROOT="${DATA_ROOT:-data/2018WBC_cellcrop_512x512_to_256x256_first50bands_multicandidate_manualoverride_filtered_minmax_20260903_1455/E}"
 # DATA_ROOT="${DATA_ROOT:-data/2018WBC_cellcrop_512x512_to_256x256_first50bands_multicandidate_manualoverride_filtered_minmax_20260903_1455/L}"
@@ -117,7 +118,7 @@ BLAS_THREADS_PER_WORKER="${BLAS_THREADS_PER_WORKER:-0}"
 # ── 优化 #6：GPU 设备选择（可选） ────────────────────────────────────────────
 GPU_ID="${GPU_ID:-6,7}"     # 如 7（单卡）或 6,7（多卡，逗号分隔）；为空则不覆盖
                           # 已有的 CUDA_VISIBLE_DEVICES（=本机所有 GPU 都可见）
-DEVICE="${DEVICE:-cuda:0}"     # 如 cuda:0 / cpu；为空（或 cuda）表示自动选择，且只在
+DEVICE="${DEVICE:-cuda:1}"     # 如 cuda:0 / cpu；为空（或 cuda）表示自动选择，且只在
                           # GPU_ID 限定的可见范围内选（见文件头注释）
 DTYPE="${DTYPE:-float32}" # float32（默认）或 float64
 
