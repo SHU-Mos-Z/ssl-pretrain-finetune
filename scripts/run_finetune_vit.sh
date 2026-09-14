@@ -31,6 +31,9 @@ SPECTRAL_PATCH_SIZE=10
 NUM_ENDMEMBERS=8
 AGGREGATE_MODE="mean"
 FREEZE_BACKBONE=false
+# 留空时不传参，由 Python 使用历史 all_class 损失；设为 foreground
+# 时使用全类别加权 CE + 前景 Dice + 前景 boundary。
+SEGMENTATION_LOSS_MODE="${SEGMENTATION_LOSS_MODE:-}"
 
 WORKERS=4
 SAVE_INTERVAL=10
@@ -51,6 +54,10 @@ fi
 FREEZE_ARG=""
 if [ "$FREEZE_BACKBONE" = "true" ]; then
     FREEZE_ARG="--freeze-backbone"
+fi
+SEGMENTATION_LOSS_MODE_ARGS=()
+if [ -n "$SEGMENTATION_LOSS_MODE" ]; then
+    SEGMENTATION_LOSS_MODE_ARGS+=(--segmentation-loss-mode "$SEGMENTATION_LOSS_MODE")
 fi
 
 MASTER_PORT=$(python3 -c "
@@ -84,6 +91,7 @@ OMP_NUM_THREADS=2 torchrun \
     --spectral-patch-size $SPECTRAL_PATCH_SIZE \
     --num-endmembers     $NUM_ENDMEMBERS \
     --aggregate-mode     $AGGREGATE_MODE \
+    "${SEGMENTATION_LOSS_MODE_ARGS[@]}" \
     --workers            $WORKERS \
     --save-interval      $SAVE_INTERVAL \
     --n-vis              $N_VIS \

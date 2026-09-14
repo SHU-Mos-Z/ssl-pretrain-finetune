@@ -60,6 +60,20 @@ class FinetuneDataset(Dataset):
     def __len__(self) -> int:
         return len(self.filenames)
 
+    def class_pixel_counts(self, num_classes: int) -> torch.Tensor:
+        """Count training-mask pixels for deterministic loss weighting."""
+        counts = np.zeros(int(num_classes), dtype=np.int64)
+        for fname in self.filenames:
+            seg = np.load(os.path.join(self.masks_dir, fname))
+            if seg.ndim == 3:
+                seg = seg.squeeze(-1)
+            valid = (seg >= 0) & (seg < num_classes)
+            if np.any(valid):
+                counts += np.bincount(
+                    seg[valid].astype(np.int64, copy=False), minlength=num_classes
+                )[:num_classes]
+        return torch.from_numpy(counts)
+
     def __getitem__(self, idx: int) -> dict:
         fname = self.filenames[idx]
         intensity = load_intensity_cube(os.path.join(self.images_dir, fname))

@@ -103,6 +103,9 @@ HEAD_DROPOUT="${HEAD_DROPOUT:-0.1}"
 ASPP_RATES="${ASPP_RATES:-1,6,12,18}"
 
 SEGMENTATION_LOSS="${SEGMENTATION_LOSS:-ce_dice}"
+# Leave empty to let Python preserve the historical all-class loss exactly.
+# Set to foreground for weighted all-class CE + foreground Dice + boundary.
+SEGMENTATION_LOSS_MODE="${SEGMENTATION_LOSS_MODE:-}"
 CE_LOSS_WEIGHT="${CE_LOSS_WEIGHT:-1.0}"
 DICE_LOSS_WEIGHT="${DICE_LOSS_WEIGHT:-1.0}"
 FOCAL_GAMMA="${FOCAL_GAMMA:-2.0}"
@@ -191,6 +194,10 @@ SCENE_ENDMEMBER_ARG=""
 if [ -n "$SCENE_ENDMEMBER_ROOT" ]; then
     SCENE_ENDMEMBER_ARG="--scene-endmember-root $SCENE_ENDMEMBER_ROOT"
 fi
+SEGMENTATION_LOSS_MODE_ARGS=()
+if [ -n "$SEGMENTATION_LOSS_MODE" ]; then
+    SEGMENTATION_LOSS_MODE_ARGS+=(--segmentation-loss-mode "$SEGMENTATION_LOSS_MODE")
+fi
 EVAL_ONLY_ARGS=()
 if [ -n "$EVAL_ONLY_CHECKPOINT" ]; then
     EVAL_ONLY_ARGS+=(--eval-only-checkpoint "$EVAL_ONLY_CHECKPOINT")
@@ -265,6 +272,7 @@ OMP_NUM_THREADS=2 torchrun \
     --head-dropout           $HEAD_DROPOUT \
     --aspp-rates             "$ASPP_RATES" \
     --segmentation-loss      "$SEGMENTATION_LOSS" \
+    "${SEGMENTATION_LOSS_MODE_ARGS[@]}" \
     --ce-loss-weight         $CE_LOSS_WEIGHT \
     --dice-loss-weight       $DICE_LOSS_WEIGHT \
     --focal-gamma            $FOCAL_GAMMA \

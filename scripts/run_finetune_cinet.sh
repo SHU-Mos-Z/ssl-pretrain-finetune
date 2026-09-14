@@ -57,6 +57,9 @@ DECODER_MID_CH=64           # PixelDecoder final_conv 中间通道数
 
 # ── 迁移学习 ──────────────────────────────────────────────────────────────────
 FREEZE_BACKBONE=false       # 是否冻结 backbone（Linear Probe 模式设为 true）
+# 留空时不传参，由 Python 使用历史 all_class 损失；设为 foreground
+# 时使用全类别加权 CE + 前景 Dice + 前景 boundary。
+SEGMENTATION_LOSS_MODE="${SEGMENTATION_LOSS_MODE:-}"
 
 # ── 日志 / 存储 ───────────────────────────────────────────────────────────────
 WORKERS=4
@@ -79,6 +82,10 @@ fi
 FREEZE_ARG=""
 if [ "$FREEZE_BACKBONE" = "true" ]; then
     FREEZE_ARG="--freeze-backbone"
+fi
+SEGMENTATION_LOSS_MODE_ARGS=()
+if [ -n "$SEGMENTATION_LOSS_MODE" ]; then
+    SEGMENTATION_LOSS_MODE_ARGS+=(--segmentation-loss-mode "$SEGMENTATION_LOSS_MODE")
 fi
 
 MASTER_PORT=$(python3 -c "
@@ -120,6 +127,7 @@ OMP_NUM_THREADS=2 torchrun \
     --ciam-dropout        $CIAM_DROPOUT \
     --ciam-ffn-ratio      $CIAM_FFN_RATIO \
     --decoder-mid-ch      $DECODER_MID_CH \
+    "${SEGMENTATION_LOSS_MODE_ARGS[@]}" \
     --workers             $WORKERS \
     --save-interval       $SAVE_INTERVAL \
     --n-vis               $N_VIS \

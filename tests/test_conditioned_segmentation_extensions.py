@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from models.finetune_model_vit import SegmentationHead
 from models.modules_conditioned.segmentation_heads import build_segmentation_head
@@ -33,6 +34,45 @@ def test_historical_head_and_loss_are_exactly_preserved() -> None:
     torch.testing.assert_close(expected, actual, rtol=0, atol=0)
     torch.testing.assert_close(old_loss, new_loss, rtol=0, atol=0)
     assert list(historical.state_dict()) == list(configured.state_dict())
+
+
+def test_foreground_loss_mode_uses_weighted_all_class_ce_and_foreground_dice() -> None:
+    logits = torch.tensor(
+        [[
+            [[3.0, 0.2], [0.1, 0.3]],
+            [[0.1, 2.5], [1.5, 0.2]],
+            [[0.0, 0.1], [0.2, 2.0]],
+        ]],
+        requires_grad=True,
+    )
+    target = torch.tensor([[[0, 1], [1, 2]]])
+    weights = torch.tensor([0.5, 1.0, 1.5])
+    criterion = build_segmentation_criterion(
+        3,
+        loss_type="ce_dice",
+        class_weights=weights,
+        computation_mode="foreground",
+    )
+    loss, logs = criterion(logits, target)
+
+    expected_ce = F.cross_entropy(logits, target, weight=weights)
+    probabilities = logits.softmax(dim=1)
+    one_hot = F.one_hot(target, 3).permute(0, 3, 1, 2).to(logits.dtype)
+    intersection = (probabilities * one_hot).sum((0, 2, 3))
+    denominator = (probabilities + one_hot).sum((0, 2, 3))
+    foreground_dice_loss = 1.0 - (
+        (2.0 * intersection[1:] + 1e-6) / (denominator[1:] + 1e-6)
+    ).mean()
+
+    torch.testing.assert_close(
+        torch.tensor(logs["loss_ce_or_focal"]), expected_ce.detach()
+    )
+    torch.testing.assert_close(
+        torch.tensor(logs["loss_dice"]), foreground_dice_loss.detach()
+    )
+    assert criterion.boundary_weight == 0.2
+    loss.backward()
+    assert torch.isfinite(logits.grad).all()
 
 
 def test_all_new_heads_and_losses_have_finite_gradients() -> None:

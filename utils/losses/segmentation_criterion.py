@@ -16,6 +16,13 @@ SEGMENTATION_LOSS_TYPES = (
     "weighted_ce_dice_boundary",
 )
 
+SEGMENTATION_LOSS_MODES = (
+    "all_class",
+    "foreground",
+)
+
+DEFAULT_FOREGROUND_BOUNDARY_WEIGHT = 0.2
+
 
 def primary_segmentation_logits(
     prediction: torch.Tensor | dict[str, object],
@@ -40,11 +47,16 @@ class ConfigurableSegmentationLoss(nn.Module):
         focal_gamma: float = 2.0,
         boundary_weight: float = 0.0,
         auxiliary_weight: float = 0.0,
+        computation_mode: str = "all_class",
         ignore_index: int = -1,
     ):
         super().__init__()
         if loss_type not in SEGMENTATION_LOSS_TYPES:
             raise ValueError(f"loss_type must be one of {SEGMENTATION_LOSS_TYPES}")
+        if computation_mode not in SEGMENTATION_LOSS_MODES:
+            raise ValueError(
+                f"computation_mode must be one of {SEGMENTATION_LOSS_MODES}"
+            )
         self.num_classes = int(num_classes)
         self.loss_type = loss_type
         self.ce_weight = float(ce_weight)
@@ -52,6 +64,7 @@ class ConfigurableSegmentationLoss(nn.Module):
         self.focal_gamma = float(focal_gamma)
         self.boundary_weight = float(boundary_weight)
         self.auxiliary_weight = float(auxiliary_weight)
+        self.computation_mode = computation_mode
         self.ignore_index = int(ignore_index)
         weights = (
             torch.ones(self.num_classes, dtype=torch.float32)
@@ -71,13 +84,28 @@ class ConfigurableSegmentationLoss(nn.Module):
         intersection = (probabilities * one_hot * mask).sum((0, 2, 3))
         denominator = ((probabilities + one_hot) * mask).sum((0, 2, 3))
         class_dice = (2.0 * intersection + 1e-6) / (denominator + 1e-6)
+        if self.computation_mode == "foreground":
+            # Keep the background in CE so foreground false positives on
+            # background pixels are still supervised, but align the overlap
+            # term with foreground-only reporting. Each foreground class has
+            # equal influence in this differentiable macro surrogate.
+            return 1.0 - class_dice[1:].mean()
         if self.loss_type.startswith("weighted_"):
             normalized = self.class_weights / self.class_weights.sum()
             return 1.0 - (class_dice * normalized).sum()
         return 1.0 - class_dice.mean()
 
     def _classification_loss(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        weight = self.class_weights if self.loss_type.startswith("weighted_") else None
+        weight = (
+            self.class_weights
+            if self.computation_mode == "foreground"
+            or self.loss_type.startswith("weighted_")
+            else None
+        )
+        if self.computation_mode == "foreground":
+            return F.cross_entropy(
+                logits, target, weight=weight, ignore_index=self.ignore_index
+            )
         if self.loss_type == "focal_dice":
             ce = F.cross_entropy(
                 logits, target, reduction="none", ignore_index=self.ignore_index
@@ -164,9 +192,22 @@ def build_segmentation_criterion(
     focal_gamma: float = 2.0,
     boundary_weight: float = 0.0,
     auxiliary_weight: float = 0.0,
+    computation_mode: str = "all_class",
 ) -> nn.Module:
+    if computation_mode not in SEGMENTATION_LOSS_MODES:
+        raise ValueError(f"computation_mode must be one of {SEGMENTATION_LOSS_MODES}")
+    if computation_mode == "foreground":
+        if num_classes < 2:
+            raise ValueError("foreground loss mode requires at least two classes")
+        if class_weights is None:
+            raise ValueError(
+                "foreground loss mode requires all-class CE weights"
+            )
+        if boundary_weight <= 0:
+            boundary_weight = DEFAULT_FOREGROUND_BOUNDARY_WEIGHT
     if (
-        loss_type == "ce_dice"
+        computation_mode == "all_class"
+        and loss_type == "ce_dice"
         and class_weights is None
         and ce_weight == 1.0
         and dice_weight == 1.0
@@ -184,11 +225,14 @@ def build_segmentation_criterion(
         focal_gamma=focal_gamma,
         boundary_weight=boundary_weight,
         auxiliary_weight=auxiliary_weight,
+        computation_mode=computation_mode,
     )
 
 
 __all__ = [
     "SEGMENTATION_LOSS_TYPES",
+    "SEGMENTATION_LOSS_MODES",
+    "DEFAULT_FOREGROUND_BOUNDARY_WEIGHT",
     "ConfigurableSegmentationLoss",
     "build_segmentation_criterion",
     "primary_segmentation_logits",

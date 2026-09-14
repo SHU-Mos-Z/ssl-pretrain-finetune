@@ -53,6 +53,7 @@ echo "==========================================================================
 echo "GPCC 0913 sequential detection experiments"
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES NUM_GPUS=$NUM_GPUS"
 echo "BATCH_SIZE_PER_GPU=$BATCH_SIZE_PER_GPU ACCUMULATION=$GRADIENT_ACCUMULATION_STEPS LR=$LR"
+echo "EPOCHS=$EPOCHS"
 echo "PRETRAIN_CKPT=$PRETRAIN_CKPT"
 echo "TRAIN_ROOT=$TRAIN_ROOT"
 echo "VAL_ROOT=$VAL_ROOT"

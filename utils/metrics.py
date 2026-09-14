@@ -23,6 +23,7 @@ except ImportError:  # pragma: no cover - 环境未安装 monai 时优雅降级
 HD95_BACKEND_CHOICES = ("scipy", "monai")
 
 DICE_BATCH_ALLCLASS_MACRO = "batch_allclass_macro"
+DICE_BATCH_FG_MACRO = "batch_fg_macro"
 DICE_FG_BINARY_SCENE = "fg_binary_scene"
 DICE_MICRO_FG_SCENE = "micro_fg_scene"
 DICE_WEIGHTED_FG_SCENE = "weighted_fg_scene"
@@ -33,6 +34,7 @@ DICE_GLOBAL_FREQUENCY_WEIGHTED_FG = "global_frequency_weighted_fg"
 DICE_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS = "global_frequency_weighted_all_class"
 DICE_METRIC_NAMES = (
     DICE_BATCH_ALLCLASS_MACRO,
+    DICE_BATCH_FG_MACRO,
     DICE_FG_BINARY_SCENE,
     DICE_MICRO_FG_SCENE,
     DICE_WEIGHTED_FG_SCENE,
@@ -46,6 +48,7 @@ DICE_METRIC_NAMES = (
 # IoU uses the same aggregation protocol names as Dice.  Keeping the names
 # aligned makes the two families directly comparable in logs and JSON output.
 IOU_BATCH_ALLCLASS_MACRO = DICE_BATCH_ALLCLASS_MACRO
+IOU_BATCH_FG_MACRO = DICE_BATCH_FG_MACRO
 IOU_FG_BINARY_SCENE = DICE_FG_BINARY_SCENE
 IOU_MICRO_FG_SCENE = DICE_MICRO_FG_SCENE
 IOU_WEIGHTED_FG_SCENE = DICE_WEIGHTED_FG_SCENE
@@ -62,6 +65,7 @@ _DICE_NAME_ALIASES = {
     "dice": DICE_BATCH_ALLCLASS_MACRO,
     "default": DICE_BATCH_ALLCLASS_MACRO,
     "current": DICE_BATCH_ALLCLASS_MACRO,
+    "dice_batch_fg_macro": DICE_BATCH_FG_MACRO,
     "dice_fg_binary_scene": DICE_FG_BINARY_SCENE,
     "dice_micro_fg_scene": DICE_MICRO_FG_SCENE,
     "dice_weighted_fg_scene": DICE_WEIGHTED_FG_SCENE,
@@ -211,6 +215,18 @@ def dice_batch_allclass_macro(state: "SegmentationMetricAccumulator") -> float:
     return float(state.batch_dice_sum / state.batch_sample_count)
 
 
+def dice_batch_fg_macro(state: "SegmentationMetricAccumulator") -> float:
+    """Sample-count-weighted batch macro Dice over union-present foreground classes.
+
+    Background is excluded. A foreground class absent from both prediction and
+    target in a batch is skipped; one-sided presence remains an evaluable error
+    and receives Dice 0. A batch with no evaluable foreground class is skipped.
+    """
+    if state.batch_fg_sample_count <= 0:
+        return float("nan")
+    return float(state.batch_fg_dice_sum / state.batch_fg_sample_count)
+
+
 def dice_fg_binary_scene(state: "SegmentationMetricAccumulator") -> float:
     """Mean scene-wise binary Dice after collapsing all foreground labels."""
     values = [
@@ -326,6 +342,7 @@ DiceResult = float | dict[str, float]
 DiceFunction = Callable[["SegmentationMetricAccumulator"], DiceResult]
 DICE_METRIC_FUNCTIONS: dict[str, DiceFunction] = {
     DICE_BATCH_ALLCLASS_MACRO: dice_batch_allclass_macro,
+    DICE_BATCH_FG_MACRO: dice_batch_fg_macro,
     DICE_FG_BINARY_SCENE: dice_fg_binary_scene,
     DICE_MICRO_FG_SCENE: dice_micro_fg_scene,
     DICE_WEIGHTED_FG_SCENE: dice_weighted_fg_scene,
@@ -344,6 +361,13 @@ def iou_batch_allclass_macro(state: "SegmentationMetricAccumulator") -> float:
     if state.batch_sample_count <= 0:
         return float("nan")
     return float(state.batch_iou_sum / state.batch_sample_count)
+
+
+def iou_batch_fg_macro(state: "SegmentationMetricAccumulator") -> float:
+    """Sample-count-weighted batch macro IoU over union-present foreground classes."""
+    if state.batch_fg_sample_count <= 0:
+        return float("nan")
+    return float(state.batch_fg_iou_sum / state.batch_fg_sample_count)
 
 
 def iou_fg_binary_scene(state: "SegmentationMetricAccumulator") -> float:
@@ -455,6 +479,7 @@ IoUResult = float | dict[str, float]
 IoUFunction = Callable[["SegmentationMetricAccumulator"], IoUResult]
 IOU_METRIC_FUNCTIONS: dict[str, IoUFunction] = {
     IOU_BATCH_ALLCLASS_MACRO: iou_batch_allclass_macro,
+    IOU_BATCH_FG_MACRO: iou_batch_fg_macro,
     IOU_FG_BINARY_SCENE: iou_fg_binary_scene,
     IOU_MICRO_FG_SCENE: iou_micro_fg_scene,
     IOU_WEIGHTED_FG_SCENE: iou_weighted_fg_scene,
@@ -484,6 +509,9 @@ class SegmentationMetricAccumulator:
     scene_counts: dict[str, _SceneDiceCounts] = field(default_factory=dict)
     batch_dice_sum: float = 0.0
     batch_iou_sum: float = 0.0
+    batch_fg_dice_sum: float = 0.0
+    batch_fg_iou_sum: float = 0.0
+    batch_fg_sample_count: int = 0
     batch_hd95_sum: float = 0.0
     batch_sample_count: int = 0
     _anonymous_scene_offset: int = 0
@@ -578,6 +606,25 @@ class SegmentationMetricAccumulator:
             mean_batch_iou = float(np.mean(batch_iou))
         self.batch_dice_sum += mean_batch_dice * batch_size
         self.batch_iou_sum += mean_batch_iou * batch_size
+        foreground_evaluable = (predicted[1:] + target_area[1:]) > 0.0
+        if np.any(foreground_evaluable):
+            foreground_denominator = predicted[1:] + target_area[1:]
+            foreground_union = (
+                predicted[1:] + target_area[1:] - intersection[1:]
+            )
+            foreground_dice = (
+                2.0 * intersection[1:][foreground_evaluable]
+                / foreground_denominator[foreground_evaluable]
+            )
+            foreground_iou = (
+                intersection[1:][foreground_evaluable]
+                / foreground_union[foreground_evaluable]
+            )
+            mean_batch_fg_dice = float(np.mean(foreground_dice))
+            mean_batch_fg_iou = float(np.mean(foreground_iou))
+            self.batch_fg_dice_sum += mean_batch_fg_dice * batch_size
+            self.batch_fg_iou_sum += mean_batch_fg_iou * batch_size
+            self.batch_fg_sample_count += batch_size
         self.batch_hd95_sum += (
             compute_hd95(
                 pred,
@@ -617,6 +664,9 @@ class SegmentationMetricAccumulator:
             "global_target": self.global_target,
             "batch_dice_sum": self.batch_dice_sum,
             "batch_iou_sum": self.batch_iou_sum,
+            "batch_fg_dice_sum": self.batch_fg_dice_sum,
+            "batch_fg_iou_sum": self.batch_fg_iou_sum,
+            "batch_fg_sample_count": self.batch_fg_sample_count,
             "batch_hd95_sum": self.batch_hd95_sum,
             "batch_sample_count": self.batch_sample_count,
             "scene_counts": self.scene_counts,
@@ -629,6 +679,9 @@ class SegmentationMetricAccumulator:
         self.scene_counts.clear()
         self.batch_dice_sum = 0.0
         self.batch_iou_sum = 0.0
+        self.batch_fg_dice_sum = 0.0
+        self.batch_fg_iou_sum = 0.0
+        self.batch_fg_sample_count = 0
         self.batch_hd95_sum = 0.0
         self.batch_sample_count = 0
 
@@ -638,6 +691,9 @@ class SegmentationMetricAccumulator:
         self.global_target += payload["global_target"]
         self.batch_dice_sum += float(payload["batch_dice_sum"])
         self.batch_iou_sum += float(payload["batch_iou_sum"])
+        self.batch_fg_dice_sum += float(payload["batch_fg_dice_sum"])
+        self.batch_fg_iou_sum += float(payload["batch_fg_iou_sum"])
+        self.batch_fg_sample_count += int(payload["batch_fg_sample_count"])
         self.batch_hd95_sum += float(payload["batch_hd95_sum"])
         self.batch_sample_count += int(payload["batch_sample_count"])
         for scene_id, other_scene in payload["scene_counts"].items():
@@ -703,7 +759,7 @@ def compute_segmentation_metrics(
     scene_ids: Sequence[str] | None = None,
     ignore_index: int = -1,
 ) -> dict[str, Any]:
-    """Compute selected Dice protocols plus the historical IoU and HD95.
+    """Compute selected Dice protocols, all IoU protocols, and HD95.
 
     This one-shot entry point treats its input as the complete evaluation scope.
     Training/validation code that spans multiple mini-batches must instead call
@@ -822,6 +878,46 @@ def iou_score(
         union = pred_c.sum() + tgt_c.sum() - inter
         iou_per_class.append((inter + smooth) / (union + smooth))
     return torch.stack(iou_per_class).mean()
+
+
+def batch_fg_macro_scores(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    num_classes: int,
+    ignore_index: int = -1,
+) -> tuple[float, float]:
+    """Return one batch's foreground macro Dice and IoU.
+
+    The batch is pooled spatially before scoring. Background is excluded;
+    classes absent from both prediction and target are skipped, while one-sided
+    classes contribute zero. When no foreground class is evaluable, both
+    results are NaN so callers can skip that batch.
+    """
+    if pred.dim() == 4:
+        pred = pred.argmax(dim=1)
+    if pred.shape != target.shape:
+        raise ValueError(
+            f"prediction/target shape mismatch: {tuple(pred.shape)} vs "
+            f"{tuple(target.shape)}"
+        )
+    valid = target != ignore_index
+    dice_values: list[float] = []
+    iou_values: list[float] = []
+    for class_index in range(1, int(num_classes)):
+        pred_c = (pred == class_index) & valid
+        target_c = (target == class_index) & valid
+        predicted = int(pred_c.sum().item())
+        target_area = int(target_c.sum().item())
+        if predicted + target_area <= 0:
+            continue
+        intersection = int((pred_c & target_c).sum().item())
+        dice_values.append(2.0 * intersection / (predicted + target_area))
+        iou_values.append(
+            intersection / (predicted + target_area - intersection)
+        )
+    if not dice_values:
+        return float("nan"), float("nan")
+    return float(np.mean(dice_values)), float(np.mean(iou_values))
 
 
 def pixel_accuracy(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

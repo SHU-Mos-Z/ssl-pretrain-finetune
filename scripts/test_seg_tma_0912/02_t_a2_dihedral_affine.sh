@@ -98,6 +98,9 @@ HEAD_DROPOUT="${HEAD_DROPOUT:-0.1}"
 ASPP_RATES="${ASPP_RATES:-1,6,12,18}"
 
 SEGMENTATION_LOSS="${SEGMENTATION_LOSS:-ce_dice}"
+# Leave empty to let Python preserve the historical all-class loss exactly.
+# Set to foreground for weighted all-class CE + foreground Dice + boundary.
+SEGMENTATION_LOSS_MODE="${SEGMENTATION_LOSS_MODE:-}"
 CE_LOSS_WEIGHT="${CE_LOSS_WEIGHT:-1.0}"
 DICE_LOSS_WEIGHT="${DICE_LOSS_WEIGHT:-1.0}"
 FOCAL_GAMMA="${FOCAL_GAMMA:-2.0}"
@@ -143,8 +146,12 @@ BEST_VAL_INTERVAL="${BEST_VAL_INTERVAL:-10}"
 PROGRESS="${PROGRESS:-log}"
 LOG_INTERVAL="${LOG_INTERVAL:-10}"
 DATASET_INFO="TMA-256x256-b60-tok${PATCH_SIZE}-sp${SPECTRAL_PATCH_SIZE}"
+LOSS_MODE_SUFFIX=""
+if [ "$SEGMENTATION_LOSS_MODE" = "foreground" ]; then
+    LOSS_MODE_SUFFIX="_use-fgDiceLoss"
+fi
 EXP_TIME=$(date +%Y%m%d_%H%M%S)
-SAVE_DIR="${SAVE_DIR:-./records/test_seg_tma_0912/${EXPERIMENT_ID}_${DATASET_INFO}_${EXP_TIME}}"
+SAVE_DIR="${SAVE_DIR:-./records/test_seg_tma_0912/${EXPERIMENT_ID}_${DATASET_INFO}${LOSS_MODE_SUFFIX}_${EXP_TIME}}"
 mkdir -p "$SAVE_DIR"
 echo "DATASET_INFO=$DATASET_INFO"
 echo "SAVE_DIR=$SAVE_DIR"
@@ -189,6 +196,10 @@ fi
 DISTRIBUTED_VALIDATION_ARG=""
 if [ "$DISTRIBUTED_VALIDATION" = "true" ]; then
     DISTRIBUTED_VALIDATION_ARG="--distributed-validation"
+fi
+SEGMENTATION_LOSS_MODE_ARGS=()
+if [ -n "$SEGMENTATION_LOSS_MODE" ]; then
+    SEGMENTATION_LOSS_MODE_ARGS+=(--segmentation-loss-mode "$SEGMENTATION_LOSS_MODE")
 fi
 EVAL_ONLY_ARGS=()
 if [ -n "$EVAL_ONLY_CHECKPOINT" ]; then
@@ -253,6 +264,7 @@ OMP_NUM_THREADS=2 torchrun \
     --head-dropout           $HEAD_DROPOUT \
     --aspp-rates             "$ASPP_RATES" \
     --segmentation-loss      "$SEGMENTATION_LOSS" \
+    "${SEGMENTATION_LOSS_MODE_ARGS[@]}" \
     --ce-loss-weight         $CE_LOSS_WEIGHT \
     --dice-loss-weight       $DICE_LOSS_WEIGHT \
     --focal-gamma            $FOCAL_GAMMA \

@@ -7,12 +7,14 @@ import torch
 
 from utils.metrics import (
     DICE_BATCH_ALLCLASS_MACRO,
+    DICE_BATCH_FG_MACRO,
     DICE_CLASSWISE,
     DICE_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS,
     DICE_GLOBAL_FREQUENCY_WEIGHTED_FG,
     DICE_GLOBAL_FG,
     DICE_METRIC_NAMES,
     IOU_BATCH_ALLCLASS_MACRO,
+    IOU_BATCH_FG_MACRO,
     IOU_CLASSWISE,
     IOU_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS,
     IOU_GLOBAL_FREQUENCY_WEIGHTED_FG,
@@ -138,7 +140,8 @@ def test_global_and_scene_metrics_are_batch_partition_invariant() -> None:
         ],
         dtype=torch.long,
     )
-    names = [name for name in DICE_METRIC_NAMES if name != DICE_BATCH_ALLCLASS_MACRO]
+    batch_dependent = {DICE_BATCH_ALLCLASS_MACRO, DICE_BATCH_FG_MACRO}
+    names = [name for name in DICE_METRIC_NAMES if name not in batch_dependent]
 
     whole = SegmentationMetricAccumulator(3, names)
     whole.update(pred, target, scene_ids=["s1", "s1", "s2"])
@@ -158,9 +161,54 @@ def test_global_and_scene_metrics_are_batch_partition_invariant() -> None:
     whole_iou = whole.compute()["IoU_metrics"]
     split_iou = split.compute()["IoU_metrics"]
     for name in IOU_METRIC_NAMES:
-        if name == IOU_BATCH_ALLCLASS_MACRO:
+        if name in {IOU_BATCH_ALLCLASS_MACRO, IOU_BATCH_FG_MACRO}:
             continue
         assert split_iou[name] == pytest.approx(whole_iou[name])
+
+
+def test_batch_fg_macro_skips_jointly_absent_classes_and_excludes_background() -> None:
+    # class 1 is perfect; class 2 is absent from both sides and must be skipped.
+    target = torch.tensor([[[0, 0], [1, 1]]], dtype=torch.long)
+    pred = target.clone()
+    metrics = compute_segmentation_metrics(
+        _labels_to_logits(pred, num_classes=3),
+        target,
+        num_classes=3,
+        dice_metrics=[DICE_BATCH_FG_MACRO],
+    )
+
+    assert metrics["Dice"][DICE_BATCH_FG_MACRO] == pytest.approx(1.0)
+    assert metrics["IoU_metrics"][IOU_BATCH_FG_MACRO] == pytest.approx(1.0)
+
+
+def test_batch_fg_macro_counts_one_sided_presence_as_zero() -> None:
+    # class 1 is perfect and class 2 is a pure false positive, so foreground
+    # macro Dice/IoU are both (1 + 0) / 2.
+    target = torch.tensor([[[0, 0], [1, 1]]], dtype=torch.long)
+    pred = torch.tensor([[[2, 0], [1, 1]]], dtype=torch.long)
+    metrics = compute_segmentation_metrics(
+        _labels_to_logits(pred, num_classes=3),
+        target,
+        num_classes=3,
+        dice_metrics=[DICE_BATCH_FG_MACRO],
+    )
+
+    assert metrics["Dice"][DICE_BATCH_FG_MACRO] == pytest.approx(0.5)
+    assert metrics["IoU_metrics"][IOU_BATCH_FG_MACRO] == pytest.approx(0.5)
+
+
+def test_batch_fg_macro_skips_fully_empty_batches_and_weights_valid_batches() -> None:
+    accumulator = SegmentationMetricAccumulator(2, [DICE_BATCH_FG_MACRO])
+    empty = torch.zeros((2, 2, 2), dtype=torch.long)
+    accumulator.update(empty, empty)
+
+    target = torch.tensor([[[0, 1], [1, 0]]], dtype=torch.long)
+    pred = torch.tensor([[[0, 1], [0, 0]]], dtype=torch.long)
+    accumulator.update(pred, target)
+    metrics = accumulator.compute()
+
+    assert metrics["Dice"][DICE_BATCH_FG_MACRO] == pytest.approx(2.0 / 3.0)
+    assert metrics["IoU_metrics"][IOU_BATCH_FG_MACRO] == pytest.approx(0.5)
 
 
 def test_global_frequency_weighted_dice_and_iou_use_gt_pixel_frequency() -> None:

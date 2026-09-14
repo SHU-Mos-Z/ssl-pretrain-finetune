@@ -25,8 +25,8 @@ from tqdm import tqdm
 
 from models.finetune_model_cinet import FinetuneModelCINET
 from utils.datasets import build_finetune_loaders
-from utils.losses import SegLoss
-from utils.metrics import dice_score, hd95_score, iou_score
+from utils.losses import SEGMENTATION_LOSS_MODES, SegLoss, build_segmentation_criterion
+from utils.metrics import batch_fg_macro_scores, dice_score, hd95_score, iou_score
 from utils.scheduler import build_cosine_scheduler
 
 
@@ -107,6 +107,12 @@ def get_args():
                    help="NMFPretrainModelCINET checkpoint 路径（可选）")
     p.add_argument("--freeze-backbone", action="store_true",
                    help="冻结 backbone，仅训练 PixelDecoder（Linear Probe）")
+    p.add_argument(
+        "--segmentation-loss-mode",
+        choices=SEGMENTATION_LOSS_MODES,
+        default="all_class",
+        help="all_class preserves SegLoss; foreground uses weighted all-class CE plus foreground Dice and boundary",
+    )
 
     # ── 日志 / 存储 ──
     p.add_argument("--workers", type=int, default=4)
@@ -188,6 +194,8 @@ def train_one_epoch(
 def evaluate(model, loader, num_classes, args):
     model.eval()
     dice_vals, iou_vals = [], []
+    batch_fg_dice_sum = batch_fg_iou_sum = 0.0
+    batch_fg_sample_count = 0
     all_preds, all_targets = [], []
     for batch in loader:
         batch = _move_batch(batch, torch.cuda.current_device())
@@ -195,6 +203,14 @@ def evaluate(model, loader, num_classes, args):
         logits = model(batch, w_abund=0.0)
         dice_vals.append(dice_score(logits, seg, num_classes).item())
         iou_vals.append(iou_score(logits, seg, num_classes).item())
+        batch_fg_dice, batch_fg_iou = batch_fg_macro_scores(
+            logits, seg, num_classes
+        )
+        if np.isfinite(batch_fg_dice):
+            batch_size = int(seg.shape[0])
+            batch_fg_dice_sum += batch_fg_dice * batch_size
+            batch_fg_iou_sum += batch_fg_iou * batch_size
+            batch_fg_sample_count += batch_size
         all_preds.append(logits.argmax(dim=1).cpu())
         all_targets.append(seg.cpu())
     all_preds = torch.cat(all_preds, dim=0)
@@ -203,6 +219,8 @@ def evaluate(model, loader, num_classes, args):
         float(np.mean(dice_vals)),
         float(np.mean(iou_vals)),
         hd95_score(all_preds, all_targets, num_classes),
+        batch_fg_dice_sum / batch_fg_sample_count if batch_fg_sample_count else float("nan"),
+        batch_fg_iou_sum / batch_fg_sample_count if batch_fg_sample_count else float("nan"),
     )
 
 
@@ -310,7 +328,23 @@ def main():
         optimizer, args.epochs, args.warmup_epochs,
         len(train_loader), args.lr, args.min_lr,
     )
-    criterion = SegLoss(num_classes=args.num_classes)
+    if args.segmentation_loss_mode == "all_class":
+        criterion = SegLoss(num_classes=args.num_classes)
+    else:
+        counts = train_loader.dataset.class_pixel_counts(args.num_classes).to(torch.float64)
+        if torch.any(counts <= 0):
+            raise ValueError(f"cannot derive foreground loss weights from {counts.tolist()}")
+        class_weights = counts.rsqrt().to(torch.float32)
+        class_weights = class_weights / class_weights.mean()
+        criterion = build_segmentation_criterion(
+            args.num_classes,
+            loss_type="weighted_ce_dice_boundary",
+            class_weights=class_weights,
+            boundary_weight=0.2,
+            computation_mode="foreground",
+        )
+        log(f"foreground loss class weights: {class_weights.tolist()}")
+    criterion = criterion.cuda()
     scaler = GradScaler(enabled=args.amp)
 
     best_dice, no_improve = 0.0, 0
@@ -324,7 +358,7 @@ def main():
             model, train_loader, optimizer, scheduler, criterion,
             scaler, epoch, args, sampler=train_sampler,
         )
-        val_dice, val_iou, val_hd95 = evaluate(
+        val_dice, val_iou, val_hd95, val_batch_fg_dice, val_batch_fg_iou = evaluate(
             model, val_loader, args.num_classes, args,
         )
         stop_signal.fill_(0)
@@ -333,6 +367,8 @@ def main():
                 f"Epoch {epoch:4d}/{args.epochs}  train_loss={train_loss:.4f}  "
                 f"val_dice={val_dice:.4f}  val_iou={val_iou:.4f}  "
                 f"val_hd95={val_hd95:.4f}  "
+                f"val_batch_fg_dice={val_batch_fg_dice:.4f}  "
+                f"val_batch_fg_iou={val_batch_fg_iou:.4f}  "
                 f"lr={optimizer.param_groups[0]['lr']:.2e}  "
                 f"time={time.time()-t0:.1f}s"
             )
@@ -360,10 +396,14 @@ def main():
         inner.load_state_dict(
             torch.load(best_ckpt, map_location="cpu", weights_only=False),
         )
-        test_dice, test_iou, test_hd95 = evaluate(
+        test_dice, test_iou, test_hd95, test_batch_fg_dice, test_batch_fg_iou = evaluate(
             model, test_loader, args.num_classes, args,
         )
-        log(f"测试集结果  Dice={test_dice:.4f}  IoU={test_iou:.4f}  HD95={test_hd95:.4f}")
+        log(
+            f"测试集结果  Dice={test_dice:.4f}  IoU={test_iou:.4f}  "
+            f"HD95={test_hd95:.4f}  batch_fg_Dice={test_batch_fg_dice:.4f}  "
+            f"batch_fg_IoU={test_batch_fg_iou:.4f}"
+        )
         save_predictions(model, test_loader, args.save_dir, args.n_vis, args.num_classes)
 
     dist.destroy_process_group()

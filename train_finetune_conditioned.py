@@ -22,9 +22,14 @@ from utils.finetune_curve_monitor import (
     FinetuneCurveMonitor,
     build_segmentation_curve_groups,
 )
-from utils.losses import build_segmentation_criterion, primary_segmentation_logits
+from utils.losses import (
+    SEGMENTATION_LOSS_MODES,
+    build_segmentation_criterion,
+    primary_segmentation_logits,
+)
 from utils.metrics import (
     DICE_BATCH_ALLCLASS_MACRO,
+    DICE_BATCH_FG_MACRO,
     DICE_CLASSWISE,
     DICE_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS,
     DICE_GLOBAL_FREQUENCY_WEIGHTED_FG,
@@ -120,6 +125,17 @@ def get_args():
         ],
         default="ce_dice",
     )
+    p.add_argument(
+        "--segmentation-loss-mode",
+        choices=SEGMENTATION_LOSS_MODES,
+        default="all_class",
+        help=(
+            "all_class preserves the historical loss exactly; foreground uses "
+            "all-class inverse-sqrt-weighted CE (unless another class-weight "
+            "mode is requested), foreground-only macro Soft Dice, and "
+            "foreground boundary Dice"
+        ),
+    )
     p.add_argument("--ce-loss-weight", type=float, default=1.0)
     p.add_argument("--dice-loss-weight", type=float, default=1.0)
     p.add_argument("--focal-gamma", type=float, default=2.0)
@@ -176,7 +192,16 @@ def get_args():
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save-dir", default="records/finetune_conditioned/run")
-    p.add_argument("--save-interval", type=int, default=10)
+    p.add_argument(
+        "--save-interval",
+        type=int,
+        default=10,
+        help=(
+            "Deprecated compatibility option; fixed-interval ckpt_epoch snapshots "
+            "are no longer written. Window checkpoints are controlled by "
+            "--best-val-interval."
+        ),
+    )
     p.add_argument(
         "--best-val-interval",
         type=int,
@@ -203,7 +228,9 @@ def get_args():
         default="",
         help=(
             "Comma-separated Dice protocols. Empty input preserves the historical "
-            "batch_allclass_macro metric. Unknown names are ignored."
+            "batch_allclass_macro metric. batch_fg_macro and the two global "
+            "frequency-weighted protocols are always reported as supplementary "
+            "metrics. Unknown names are ignored."
         ),
     )
     p.add_argument(
@@ -465,6 +492,13 @@ def _scalar_dice(metrics: dict, name: str) -> float:
     return float(value)
 
 
+def _scalar_iou(metrics: dict, name: str) -> float:
+    value = metrics["IoU_metrics"][name]
+    if isinstance(value, dict):
+        raise ValueError(f"IoU protocol {name!r} is not scalar and cannot be primary")
+    return float(value)
+
+
 def _flatten_dice_history(metrics: dict, prefix: str) -> dict[str, float]:
     flattened: dict[str, float] = {}
     for name, value in metrics["Dice"].items():
@@ -476,9 +510,29 @@ def _flatten_dice_history(metrics: dict, prefix: str) -> dict[str, float]:
     return flattened
 
 
+_METRIC_PRINT_PRIORITY = (
+    DICE_BATCH_ALLCLASS_MACRO,
+    DICE_BATCH_FG_MACRO,
+    DICE_GLOBAL_FREQUENCY_WEIGHTED_FG,
+    DICE_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS,
+)
+
+
+def _ordered_metric_items(values: dict):
+    """Put the four headline protocols first without changing stored metrics."""
+    emitted: set[str] = set()
+    for name in _METRIC_PRINT_PRIORITY:
+        if name in values:
+            emitted.add(name)
+            yield name, values[name]
+    for name, value in values.items():
+        if name not in emitted:
+            yield name, value
+
+
 def _format_dice(metrics: dict) -> str:
     fields: list[str] = []
-    for name, value in metrics["Dice"].items():
+    for name, value in _ordered_metric_items(metrics["Dice"]):
         if isinstance(value, dict):
             class_text = ", ".join(
                 f"{class_name}={class_value:.4f}"
@@ -503,7 +557,7 @@ def _flatten_iou_history(metrics: dict, prefix: str) -> dict[str, float]:
 
 def _format_iou(metrics: dict) -> str:
     fields: list[str] = []
-    for name, value in metrics["IoU_metrics"].items():
+    for name, value in _ordered_metric_items(metrics["IoU_metrics"]):
         if isinstance(value, dict):
             class_text = ", ".join(
                 f"{class_name}={class_value:.4f}"
@@ -526,8 +580,12 @@ def _parse_positive_int_tuple(text: str, name: str) -> tuple[int, ...]:
 
 
 def _resolve_class_weights(args, train_dataset) -> torch.Tensor | None:
-    weighted_loss = args.segmentation_loss.startswith("weighted_")
-    if args.class_weight_mode == "none":
+    foreground_mode = args.segmentation_loss_mode == "foreground"
+    weighted_loss = args.segmentation_loss.startswith("weighted_") or foreground_mode
+    effective_weight_mode = args.class_weight_mode
+    if foreground_mode and effective_weight_mode == "none":
+        effective_weight_mode = "inverse_sqrt"
+    if effective_weight_mode == "none":
         if weighted_loss:
             raise ValueError(
                 "weighted segmentation loss requires a non-'none' class-weight mode"
@@ -537,7 +595,7 @@ def _resolve_class_weights(args, train_dataset) -> torch.Tensor | None:
         raise ValueError(
             "class weights are only used by weighted_ce_dice variants"
         )
-    if args.class_weight_mode == "manual":
+    if effective_weight_mode == "manual":
         try:
             values = [float(item.strip()) for item in args.class_weights.split(",")]
         except ValueError as error:
@@ -553,7 +611,7 @@ def _resolve_class_weights(args, train_dataset) -> torch.Tensor | None:
             raise ValueError(f"cannot derive class weights from counts {counts.tolist()}")
         weights = (
             counts.rsqrt()
-            if args.class_weight_mode == "inverse_sqrt"
+            if effective_weight_mode == "inverse_sqrt"
             else counts.reciprocal()
         ).to(torch.float32)
     return weights / weights.mean()
@@ -650,12 +708,25 @@ def main():
             flush=True,
         )
         primary_dice_metric = DICE_BATCH_ALLCLASS_MACRO
+    if (
+        a.segmentation_loss_mode == "foreground"
+        and primary_dice_metric == DICE_BATCH_ALLCLASS_MACRO
+    ):
+        print(
+            f"[Finetune] foreground loss mode changes the effective primary "
+            f"metric from {DICE_BATCH_ALLCLASS_MACRO!r} to "
+            f"{DICE_BATCH_FG_MACRO!r}.",
+            flush=True,
+        )
+        primary_dice_metric = DICE_BATCH_FG_MACRO
+    a.effective_primary_dice_metric = primary_dice_metric
     if primary_dice_metric not in dice_metric_names:
         dice_metric_names.append(primary_dice_metric)
-    # Always report the two dataset-global frequency-weighted protocols.  They
-    # are supplementary only: the configured primary metric and checkpoint
-    # selection semantics remain unchanged.
+    # Always report the batch foreground macro and the two dataset-global
+    # frequency-weighted protocols. The effective primary protocol is selected
+    # above; all remaining entries are supplementary.
     for supplementary_metric in (
+        DICE_BATCH_FG_MACRO,
         DICE_GLOBAL_FREQUENCY_WEIGHTED_FG,
         DICE_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS,
     ):
@@ -823,7 +894,9 @@ def main():
             print(
                 f"[Eval-only] Test primary Dice ({primary_dice_metric}): "
                 f"{_scalar_dice(test_metrics, primary_dice_metric):.4f}  "
-                f"IoU: {test_metrics['IoU']:.4f}  HD95: {test_metrics['HD95']:.4f}",
+                f"IoU ({primary_dice_metric}): "
+                f"{_scalar_iou(test_metrics, primary_dice_metric):.4f}  "
+                f"HD95: {test_metrics['HD95']:.4f}",
                 flush=True,
             )
             print(f"[Eval-only] Test Dice: {_format_dice(test_metrics)}", flush=True)
@@ -860,19 +933,26 @@ def main():
         optimizer, a.epochs, a.warmup_epochs, len(train), a.lr, a.min_lr
     )
     class_weights = _resolve_class_weights(a, train.dataset)
+    effective_loss_type = (
+        "weighted_ce_dice_boundary"
+        if a.segmentation_loss_mode == "foreground"
+        else a.segmentation_loss
+    )
     criterion = build_segmentation_criterion(
         a.num_classes,
-        loss_type=a.segmentation_loss,
+        loss_type=effective_loss_type,
         class_weights=class_weights,
         ce_weight=a.ce_loss_weight,
         dice_weight=a.dice_loss_weight,
         focal_gamma=a.focal_gamma,
         boundary_weight=a.boundary_loss_weight,
         auxiliary_weight=a.aux_loss_weight,
+        computation_mode=a.segmentation_loss_mode,
     ).cuda()
     if rank == 0:
         print(
-            f"[Finetune] head={a.segmentation_head} loss={a.segmentation_loss} "
+            f"[Finetune] head={a.segmentation_head} loss={effective_loss_type} "
+            f"loss_mode={a.segmentation_loss_mode} "
             f"augment={a.augment}/{a.augmentation_policy}/copies{a.augmentation_copies}",
             flush=True,
         )
@@ -884,6 +964,11 @@ def main():
         )
         if class_weights is not None:
             print(f"[Finetune] class weights: {class_weights.tolist()}", flush=True)
+        print(
+            f"[Finetune] effective boundary loss weight: "
+            f"{float(getattr(criterion, 'boundary_weight', 0.0)):g}",
+            flush=True,
+        )
     # bfloat16 autocast 且不使用 GradScaler：与 LoTS-Net 训练脚本一致。
     # fp16 + GradScaler 每个 step 都需要同步读取 found_inf_per_device，
     # 这个高频强制同步点容易把 MONAI HD95 在验证阶段可能引入的异步 CUDA
@@ -979,7 +1064,7 @@ def main():
             max_batches=a.max_eval_batches,
         )
         dice = _scalar_dice(val_metrics, primary_dice_metric)
-        iou = float(val_metrics["IoU"])
+        iou = _scalar_iou(val_metrics, primary_dice_metric)
         hd = float(val_metrics["HD95"])
         run_scene_val = bool(
             scene_val is not None
@@ -1024,7 +1109,9 @@ def main():
                 history_values.update(
                     {
                         "val_scene_dice_primary": scene_dice,
-                        "val_scene_iou": float(scene_val_metrics["IoU"]),
+                        "val_scene_iou": _scalar_iou(
+                            scene_val_metrics, primary_dice_metric
+                        ),
                         "val_scene_hd95": float(scene_val_metrics["HD95"]),
                     }
                 )
@@ -1039,7 +1126,8 @@ def main():
                 f'[{time.strftime("%F %T")}] Epoch {epoch}/{a.epochs} '
                 f"loss={train_loss:.5f} | "
                 f"Val primary Dice ({primary_dice_metric}): {dice:.4f} | "
-                f"Val IoU: {iou:.4f} | Val HD95: {hd:.4f} | "
+                f"Val primary IoU ({primary_dice_metric}): {iou:.4f} | "
+                f"Val HD95: {hd:.4f} | "
                 f"LR: {current_lr:.1e} | time={time.time()-t0:.1f}s",
                 flush=True,
             )
@@ -1048,7 +1136,8 @@ def main():
             if scene_val_metrics is not None:
                 print(
                     f"[Scene Val] primary Dice ({primary_dice_metric}): "
-                    f"{scene_dice:.4f} | IoU: {scene_val_metrics['IoU']:.4f} | "
+                    f"{scene_dice:.4f} | primary IoU ({primary_dice_metric}): "
+                    f"{_scalar_iou(scene_val_metrics, primary_dice_metric):.4f} | "
                     f"HD95: {scene_val_metrics['HD95']:.4f}",
                     flush=True,
                 )
@@ -1095,10 +1184,11 @@ def main():
                         f"validation checks. Best {primary_dice_metric}: {best_dice:.4f}",
                         flush=True,
                     )
-            if epoch % a.save_interval == 0:
-                torch.save(
-                    state, os.path.join(a.save_dir, f"ckpt_epoch{epoch:04d}.pth")
-                )
+            # Do not retain fixed-interval epoch snapshots. ``ckpt_last.pth`` is
+            # overwritten every epoch, while the global-best and window-best
+            # checkpoints retain the model-selection states needed for testing.
+            # Keeping all three mechanisms would duplicate one checkpoint every
+            # ``save_interval`` epochs without adding a distinct evaluation path.
             if a.best_val_interval > 0:
                 window_idx = (epoch - 1) // a.best_val_interval
                 window_start = window_idx * a.best_val_interval + 1
@@ -1168,7 +1258,8 @@ def main():
                     print(
                         f"[{label}] Test primary Dice ({primary_dice_metric}): "
                         f"{_scalar_dice(test_metrics, primary_dice_metric):.4f}  "
-                        f"IoU: {test_metrics['IoU']:.4f}  "
+                        f"IoU ({primary_dice_metric}): "
+                        f"{_scalar_iou(test_metrics, primary_dice_metric):.4f}  "
                         f"HD95: {test_metrics['HD95']:.4f}",
                         flush=True,
                     )
@@ -1187,7 +1278,8 @@ def main():
             print(
                 f"Test primary Dice ({primary_dice_metric}): "
                 f"{_scalar_dice(best_test_metrics, primary_dice_metric):.4f}  "
-                f"IoU: {best_test_metrics['IoU']:.4f}  "
+                f"IoU ({primary_dice_metric}): "
+                f"{_scalar_iou(best_test_metrics, primary_dice_metric):.4f}  "
                 f"HD95: {best_test_metrics['HD95']:.4f}",
                 flush=True,
             )
