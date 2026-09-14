@@ -113,8 +113,8 @@ def _open_intensity_memmap(path: Path) -> tuple[np.ndarray, bool]:
     return array, channel_first
 
 
-class ConditionedSlidingWindowTestDataset:
-    """Lightweight full-scene test source used only by sliding inference.
+class ConditionedSlidingWindowSceneDataset:
+    """Lightweight full-scene source used by sliding validation/test inference.
 
     Images remain memory-mapped on disk.  A scene-level NMF endmember matrix is
     loaded once, then reused for every spatial tile; the full abundance map is
@@ -154,7 +154,7 @@ class ConditionedSlidingWindowTestDataset:
                 if not (self.nmf_dir / f'{stem}_E.npy').is_file()
             ]
             raise FileNotFoundError(
-                f'{len(missing)} test scenes have no scene-level endmember cache under '
+                f'{len(missing)} full scenes have no scene-level endmember cache under '
                 f'{self.nmf_dir}; first missing scenes: {missing[:10]}'
             )
         if not self.stems:
@@ -230,6 +230,10 @@ class ConditionedSlidingWindowTestDataset:
         return build_conditioned_model_inputs(
             intensity, e_star, self.wavelengths, self.cfg, self.od_max
         )
+
+
+# Backwards-compatible public name used by existing test-only call sites.
+ConditionedSlidingWindowTestDataset = ConditionedSlidingWindowSceneDataset
 
 
 class ConditionedFinetuneDataset(Dataset):
@@ -461,6 +465,7 @@ class DistributedSequentialBatchSampler(Sampler[list[int]]):
 def build_conditioned_finetune_loaders(train_root,val_root,test_root,
                                        batch_size=4,num_workers=4,distributed=False,
                                        test_inference_mode='direct',
+                                       scene_val_root=None,
                                        persistent_workers=False,
                                        prefetch_factor=2,
                                        distributed_validation=False,
@@ -471,14 +476,22 @@ def build_conditioned_finetune_loaders(train_root,val_root,test_root,
     evaluation_kwargs['augment'] = False
     evaluation_kwargs['augmentation_copies'] = 1
     val=ConditionedFinetuneDataset(val_root,**evaluation_kwargs)
+    sliding_keys = {
+        'patch_size', 'spectral_patch_size', 'nmf_k', 'nmf_l1', 'nmf_l2',
+        'nmf_l3', 'nmf_simplex', 'nmf_lam_e', 'nmf_e_clamp_max',
+        'nmf_cache_dir', 'wavelength_file', 'allow_index_wavelengths',
+        'od_max', 'endmember_scope', 'scene_endmember_root',
+    }
+    scene_val = (
+        ConditionedSlidingWindowSceneDataset(
+            scene_val_root,
+            **{key: value for key, value in kwargs.items() if key in sliding_keys},
+        )
+        if scene_val_root
+        else None
+    )
     if test_root and test_inference_mode == 'sliding_window':
-        sliding_keys = {
-            'patch_size', 'spectral_patch_size', 'nmf_k', 'nmf_l1', 'nmf_l2',
-            'nmf_l3', 'nmf_simplex', 'nmf_lam_e', 'nmf_e_clamp_max',
-            'nmf_cache_dir', 'wavelength_file', 'allow_index_wavelengths',
-            'od_max', 'endmember_scope', 'scene_endmember_root',
-        }
-        test=ConditionedSlidingWindowTestDataset(
+        test=ConditionedSlidingWindowSceneDataset(
             test_root, **{key: value for key, value in kwargs.items() if key in sliding_keys}
         )
     elif test_root and test_inference_mode == 'direct':
@@ -514,6 +527,10 @@ def build_conditioned_finetune_loaders(train_root,val_root,test_root,
         )
     else:
         val_loader=DataLoader(val,shuffle=False,**common)
-    test_loader=(test if isinstance(test,ConditionedSlidingWindowTestDataset)
+    test_loader=(test if isinstance(test,ConditionedSlidingWindowSceneDataset)
                  else DataLoader(test,shuffle=False,**common) if test else None)
+    if scene_val is not None:
+        return train_loader,val_loader,scene_val,test_loader,sampler
+    # Preserve the historical four-item public return contract unless the new
+    # complete-scene validation feature was explicitly requested.
     return train_loader,val_loader,test_loader,sampler

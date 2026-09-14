@@ -2,7 +2,21 @@
 # 条件化 backbone 分割微调（须先完成 run_pretrain_conditioned.sh）
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/experiment_naming.sh"
+source "$SCRIPT_DIR/../experiment_naming.sh"
+
+# Experiment P-Final, seed 42. Override FINAL_* after screening if needed.
+EXPERIMENT_ID="P-Final"
+SEED="42"
+AUGMENT="true"
+AUGMENTATION_COPIES="${FINAL_AUGMENTATION_COPIES:-1}"
+AUGMENTATION_POLICY="${FINAL_AUGMENTATION_POLICY:-dihedral_affine}"
+SEGMENTATION_HEAD="${FINAL_SEGMENTATION_HEAD:-h3_multiscale_aux}"
+AUX_LOSS_WEIGHT="${FINAL_AUX_LOSS_WEIGHT:-0.4}"
+SEGMENTATION_LOSS="${FINAL_SEGMENTATION_LOSS:-weighted_ce_dice_boundary}"
+CLASS_WEIGHT_MODE="${FINAL_CLASS_WEIGHT_MODE:-inverse_sqrt}"
+BOUNDARY_LOSS_WEIGHT="${FINAL_BOUNDARY_LOSS_WEIGHT:-0.2}"
+BACKBONE_LR_MULTIPLIER="${FINAL_BACKBONE_LR_MULTIPLIER:-0.1}"
+HEAD_LR_MULTIPLIER="1.0"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5}"
 NUM_GPUS="${NUM_GPUS:-2}"
@@ -19,12 +33,11 @@ BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-4}"
 # TEST_ROOT="data/GPCC_Resized_512_640_to_256_256_overlap_0_0_preprocessed_finetune_test_p015_20260728"
 
 # LUAD / PUAD official-like protocol（训练/验证为 224 patch，测试为完整场景）
-TRAIN_ROOT="${TRAIN_ROOT:-data/LUAD_PUAD_official224_centerbalanced_3660/train}"
-VAL_ROOT="${VAL_ROOT:-data/LUAD_PUAD_official224_centerbalanced_3660/val}"
-TEST_ROOT="${TEST_ROOT:-data/LUAD_PUAD_official224_centerbalanced_3660/test}"
-# Optional complete-scene validation root. Empty preserves historical patch-only
-# validation and checkpoint selection for every existing segmentation dataset.
-SCENE_VAL_ROOT="${SCENE_VAL_ROOT:-}"
+PUAD_DATA_ROOT="${PUAD_DATA_ROOT:-/home/zsq/processed_data/DFS3R-main/data/LUAD_PUAD_official224_bgaware_fg3138_bg1569_fullsceneval}"
+TRAIN_ROOT="${TRAIN_ROOT:-${PUAD_DATA_ROOT}/train}"
+VAL_ROOT="${VAL_ROOT:-${PUAD_DATA_ROOT}/val}"
+SCENE_VAL_ROOT="${SCENE_VAL_ROOT:-${PUAD_DATA_ROOT}/val_scenes}"
+TEST_ROOT="${TEST_ROOT:-${PUAD_DATA_ROOT}/test}"
 
 # TMA（分割）
 # TRAIN_ROOT="data/TMA_patch_1024x1024_overlap_0x0_to_256x256_minmax_finetune_train_p070_20260728"
@@ -37,6 +50,7 @@ EVAL_ONLY_CHECKPOINT="${EVAL_ONLY_CHECKPOINT:-}"
 
 # ── 训练超参数 ────────────────────────────────────────────────────────────────
 EPOCHS="${EPOCHS:-200}"
+# 优先使用顺序脚本或命令行导出的 LR；单独执行时保持原默认值。
 LR="${LR:-4e-4}"
 MIN_LR="${MIN_LR:-1e-6}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
@@ -115,9 +129,12 @@ ENDMEMBER_SCOPE="${ENDMEMBER_SCOPE:-patch}"
 SCENE_ENDMEMBER_ROOT="${SCENE_ENDMEMBER_ROOT:-}"
 
 # ── 日志 / 存储 ────────────────────────────────────────────────────────────────
-# WORKERS=1：与 LoTS-Net 稳定运行时的实际配置保持一致，降低 DataLoader 子进程
-# 与其它共享 GPU 机器上的进程争抢资源、进而放大 CUDA/NCCL 不稳定的概率。
-WORKERS=1
+# 默认每个 DDP rank 使用 2 个 worker；可由顺序脚本或命令行安全覆盖。
+# 常驻 worker 与预取仅改善供数速度，不改变样本、增强或训练数学语义。
+WORKERS="${WORKERS:-2}"
+PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
+DISTRIBUTED_VALIDATION="${DISTRIBUTED_VALIDATION:-true}"
 # HD95 计算后端：
 #   scipy  -> CPU 距离变换，训练更稳定（推荐默认）
 #   monai  -> 与 LoTS-Net reference 一致的 MONAI GPU 实现（本机 DDP 下可能不稳定）
@@ -127,9 +144,8 @@ HD95_BACKEND="scipy"
 # 实际会同时报告全部七种 Dice 协议。
 DICE_METRICS="${DICE_METRICS:-fg_binary_scene,micro_fg_scene,weighted_fg_scene,macro_fg_scene,classwise,global_fg}"
 PRIMARY_DICE_METRIC="${PRIMARY_DICE_METRIC:-batch_allclass_macro}"
-# Optional complete-scene validation uses the same tiled geometry as PUAD test
-# inference, but runs only at the configured epoch interval.
-SCENE_VAL_INTERVAL="${SCENE_VAL_INTERVAL:-5}"
+# 完整验证场景用于 checkpoint 选择；patch val 仍用于每轮低成本监控。
+SCENE_VAL_INTERVAL="${SCENE_VAL_INTERVAL:-10}"
 SCENE_VAL_WINDOW_SIZE="${SCENE_VAL_WINDOW_SIZE:-224}"
 SCENE_VAL_WINDOW_STRIDE="${SCENE_VAL_WINDOW_STRIDE:-112}"
 SCENE_VAL_WINDOW_BATCH_SIZE="${SCENE_VAL_WINDOW_BATCH_SIZE:-4}"
@@ -151,9 +167,9 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
 BEST_VAL_INTERVAL="${BEST_VAL_INTERVAL:-10}"
 PROGRESS="${PROGRESS:-log}"
 LOG_INTERVAL="${LOG_INTERVAL:-10}"
-DATASET_INFO="$(dataset_info_from_roots "$TRAIN_ROOT" "$VAL_ROOT" "$TEST_ROOT")-tok${PATCH_SIZE}-sp${SPECTRAL_PATCH_SIZE}"
+DATASET_INFO="PUAD-official224-bgaware-fg3138-bg1569-tok${PATCH_SIZE}-sp${SPECTRAL_PATCH_SIZE}"
 EXP_TIME=$(date +%Y%m%d_%H%M%S)
-SAVE_DIR="${SAVE_DIR:-./records/finetune_conditioned/${DATASET_INFO}_${EXP_TIME}}"
+SAVE_DIR="${SAVE_DIR:-./records/test_seg_puad_0914/${EXPERIMENT_ID}_${DATASET_INFO}_${EXP_TIME}}"
 mkdir -p "$SAVE_DIR"
 echo "DATASET_INFO=$DATASET_INFO"
 echo "SAVE_DIR=$SAVE_DIR"
@@ -191,20 +207,17 @@ SCENE_ENDMEMBER_ARG=""
 if [ -n "$SCENE_ENDMEMBER_ROOT" ]; then
     SCENE_ENDMEMBER_ARG="--scene-endmember-root $SCENE_ENDMEMBER_ROOT"
 fi
+PERSISTENT_WORKERS_ARG=""
+if [ "$PERSISTENT_WORKERS" = "true" ]; then
+    PERSISTENT_WORKERS_ARG="--persistent-workers"
+fi
+DISTRIBUTED_VALIDATION_ARG=""
+if [ "$DISTRIBUTED_VALIDATION" = "true" ]; then
+    DISTRIBUTED_VALIDATION_ARG="--distributed-validation"
+fi
 EVAL_ONLY_ARGS=()
 if [ -n "$EVAL_ONLY_CHECKPOINT" ]; then
     EVAL_ONLY_ARGS+=(--eval-only-checkpoint "$EVAL_ONLY_CHECKPOINT")
-fi
-SCENE_VAL_ARGS=()
-if [ -n "$SCENE_VAL_ROOT" ]; then
-    SCENE_VAL_ARGS+=(
-        --scene-val-root "$SCENE_VAL_ROOT"
-        --scene-val-interval "$SCENE_VAL_INTERVAL"
-        --scene-val-window-size "$SCENE_VAL_WINDOW_SIZE"
-        --scene-val-window-stride "$SCENE_VAL_WINDOW_STRIDE"
-        --scene-val-window-batch-size "$SCENE_VAL_WINDOW_BATCH_SIZE"
-        --scene-val-window-blend "$SCENE_VAL_WINDOW_BLEND"
-    )
 fi
 
 MASTER_PORT=$(python3 -c "
@@ -222,6 +235,12 @@ OMP_NUM_THREADS=2 torchrun \
     --train-root             "$TRAIN_ROOT" \
     --val-root               "$VAL_ROOT" \
     --test-root              "$TEST_ROOT" \
+    --scene-val-root          "$SCENE_VAL_ROOT" \
+    --scene-val-interval      "$SCENE_VAL_INTERVAL" \
+    --scene-val-window-size   "$SCENE_VAL_WINDOW_SIZE" \
+    --scene-val-window-stride "$SCENE_VAL_WINDOW_STRIDE" \
+    --scene-val-window-batch-size "$SCENE_VAL_WINDOW_BATCH_SIZE" \
+    --scene-val-window-blend  "$SCENE_VAL_WINDOW_BLEND" \
     --pretrain-ckpt          "$PRETRAIN_CKPT" \
     --epochs                 $EPOCHS \
     --batch-size             $BATCH_SIZE_PER_GPU \
@@ -282,6 +301,7 @@ OMP_NUM_THREADS=2 torchrun \
     --augmentation-padding-mode "$AUGMENTATION_PADDING_MODE" \
     --endmember-scope        "$ENDMEMBER_SCOPE" \
     --workers                $WORKERS \
+    --prefetch-factor         $PREFETCH_FACTOR \
     --save-interval          $SAVE_INTERVAL \
     --best-val-interval      $BEST_VAL_INTERVAL \
     --progress               $PROGRESS \
@@ -305,6 +325,7 @@ OMP_NUM_THREADS=2 torchrun \
     $FREEZE_ARG \
     $AUGMENT_ARG \
     $SCENE_ENDMEMBER_ARG \
-    "${SCENE_VAL_ARGS[@]}" \
+    $PERSISTENT_WORKERS_ARG \
+    $DISTRIBUTED_VALIDATION_ARG \
     "${EVAL_ONLY_ARGS[@]}" \
     2>&1 | tee "$SAVE_DIR/records.txt"

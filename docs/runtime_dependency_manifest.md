@@ -22,6 +22,13 @@
 - `scripts/preprocessing/puad_prepare_scene_endmembers.py`：原为 `data/original/puad_prepare_scene_endmembers.py`。文件内部实现未变，仅 Bash 调用路径变化。
 - `configs/sample_exclusions/plgc/*.json`：原为 `data/original/plgc_cls_hard_case_reports/*.json`。JSON 内容未变，仅 PLGC 实验脚本的配置路径变化。
 
+## `data/` 下的源代码白名单
+
+- `data/original/luad_preprocess_official224_centerbalanced.py`：历史 PUAD official-224 协议实现。
+- `data/original/luad_preprocess_official224_bgaware.py`：增加背景采样及完整场景验证数据的新协议。
+
+上述两项是 Python 源代码，不是数据载荷；`.gitignore` 仅对白名单文件放行，`data/` 中的 HDR、RAW、NPY、标注和预处理结果仍不进入 Git。
+
 ## Git 之外的运行输入
 
 - `data/`：原始和预处理数据、split、NMF cache、波长与标注。

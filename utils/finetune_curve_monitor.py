@@ -123,8 +123,9 @@ SEGMENTATION_CURVE_GROUPS = {
 def build_segmentation_curve_groups(
     dice_metric_names: Sequence[str],
     num_classes: int,
+    iou_metric_names: Sequence[str] = (),
 ) -> dict[str, tuple[PlotSpec, ...]]:
-    """Build segmentation plots for a dynamic set of Dice protocols."""
+    """Build segmentation plots for dynamic Dice and IoU protocols."""
     groups: dict[str, tuple[PlotSpec, ...]] = {
         "loss_curves": (("train_loss", "Train loss"),),
         "overlap_metrics": (
@@ -133,6 +134,13 @@ def build_segmentation_curve_groups(
         ),
         "boundary_metric": (("val_hd95", "Val HD95"),),
         "learning_rate": (("learning_rate", "Learning rate"),),
+        "scene_validation_overlap": (
+            ("val_scene_dice_primary", "Scene Val primary Dice"),
+            ("val_scene_iou", "Scene Val IoU"),
+        ),
+        "scene_validation_boundary": (
+            ("val_scene_hd95", "Scene Val HD95"),
+        ),
     }
     scalar_specs = tuple(
         (f"val_dice_{name}", name)
@@ -141,9 +149,39 @@ def build_segmentation_curve_groups(
     )
     if scalar_specs:
         groups["dice_protocols"] = scalar_specs
+        groups["scene_val_dice_protocols"] = tuple(
+            (f"val_scene_dice_{name}", name)
+            for name in dice_metric_names
+            if name != "classwise"
+        )
     if "classwise" in dice_metric_names:
         groups["dice_classwise"] = tuple(
             (f"val_dice_class_{class_index}", f"class {class_index}")
+            for class_index in range(num_classes)
+        )
+        groups["scene_val_dice_classwise"] = tuple(
+            (f"val_scene_dice_class_{class_index}", f"class {class_index}")
+            for class_index in range(num_classes)
+        )
+    iou_scalar_specs = tuple(
+        (f"val_iou_{name}", name)
+        for name in iou_metric_names
+        if name != "classwise"
+    )
+    if iou_scalar_specs:
+        groups["iou_protocols"] = iou_scalar_specs
+        groups["scene_val_iou_protocols"] = tuple(
+            (f"val_scene_iou_{name}", name)
+            for name in iou_metric_names
+            if name != "classwise"
+        )
+    if "classwise" in iou_metric_names:
+        groups["iou_classwise"] = tuple(
+            (f"val_iou_class_{class_index}", f"class {class_index}")
+            for class_index in range(num_classes)
+        )
+        groups["scene_val_iou_classwise"] = tuple(
+            (f"val_scene_iou_class_{class_index}", f"class {class_index}")
             for class_index in range(num_classes)
         )
     return groups

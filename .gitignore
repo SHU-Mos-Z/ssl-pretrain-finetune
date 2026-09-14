@@ -8,7 +8,13 @@
 # =============================================================================
 
 # --- Dataset and experiment artifacts (may be hundreds of GB) ----------------
-/data/
+/data/*
+# PUAD preprocessing is intentionally kept beside the original data protocol.
+# Track only these first-party Python sources; every dataset payload remains ignored.
+!/data/original/
+/data/original/*
+!/data/original/luad_preprocess_official224_centerbalanced.py
+!/data/original/luad_preprocess_official224_bgaware.py
 /records/
 /data_vis/
 /seg_label_rgb/

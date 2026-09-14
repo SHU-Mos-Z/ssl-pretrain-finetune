@@ -29,6 +29,8 @@ DICE_WEIGHTED_FG_SCENE = "weighted_fg_scene"
 DICE_MACRO_FG_SCENE = "macro_fg_scene"
 DICE_CLASSWISE = "classwise"
 DICE_GLOBAL_FG = "global_fg"
+DICE_GLOBAL_FREQUENCY_WEIGHTED_FG = "global_frequency_weighted_fg"
+DICE_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS = "global_frequency_weighted_all_class"
 DICE_METRIC_NAMES = (
     DICE_BATCH_ALLCLASS_MACRO,
     DICE_FG_BINARY_SCENE,
@@ -37,7 +39,24 @@ DICE_METRIC_NAMES = (
     DICE_MACRO_FG_SCENE,
     DICE_CLASSWISE,
     DICE_GLOBAL_FG,
+    DICE_GLOBAL_FREQUENCY_WEIGHTED_FG,
+    DICE_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS,
 )
+
+# IoU uses the same aggregation protocol names as Dice.  Keeping the names
+# aligned makes the two families directly comparable in logs and JSON output.
+IOU_BATCH_ALLCLASS_MACRO = DICE_BATCH_ALLCLASS_MACRO
+IOU_FG_BINARY_SCENE = DICE_FG_BINARY_SCENE
+IOU_MICRO_FG_SCENE = DICE_MICRO_FG_SCENE
+IOU_WEIGHTED_FG_SCENE = DICE_WEIGHTED_FG_SCENE
+IOU_MACRO_FG_SCENE = DICE_MACRO_FG_SCENE
+IOU_CLASSWISE = DICE_CLASSWISE
+IOU_GLOBAL_FG = DICE_GLOBAL_FG
+IOU_GLOBAL_FREQUENCY_WEIGHTED_FG = DICE_GLOBAL_FREQUENCY_WEIGHTED_FG
+IOU_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS = (
+    DICE_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS
+)
+IOU_METRIC_NAMES = DICE_METRIC_NAMES
 
 _DICE_NAME_ALIASES = {
     "dice": DICE_BATCH_ALLCLASS_MACRO,
@@ -49,6 +68,10 @@ _DICE_NAME_ALIASES = {
     "dice_macro_fg_scene": DICE_MACRO_FG_SCENE,
     "dice_classwise": DICE_CLASSWISE,
     "dice_global_fg": DICE_GLOBAL_FG,
+    "dice_global_frequency_weighted_fg": DICE_GLOBAL_FREQUENCY_WEIGHTED_FG,
+    "dice_global_frequency_weighted_all_class": (
+        DICE_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS
+    ),
 }
 
 
@@ -146,6 +169,39 @@ def _dice_or_nan(intersection: float, predicted: float, target: float) -> float:
     if denominator <= 0.0:
         return float("nan")
     return float(2.0 * intersection / denominator)
+
+
+def _iou_or_nan(intersection: float, predicted: float, target: float) -> float:
+    denominator = float(predicted + target - intersection)
+    if denominator <= 0.0:
+        return float("nan")
+    return float(intersection / denominator)
+
+
+def _global_frequency_weighted_overlap(
+    state: "SegmentationMetricAccumulator",
+    overlap_function: Callable[[float, float, float], float],
+    *,
+    include_background: bool,
+) -> float:
+    """GT-frequency-weighted overlap from dataset-global class counts."""
+    start = 0 if include_background else 1
+    target_counts = state.global_target[start:]
+    total_target = float(target_counts.sum())
+    if total_target <= 0.0:
+        return float("nan")
+    value = 0.0
+    for class_index in range(start, state.num_classes):
+        weight = float(state.global_target[class_index] / total_target)
+        if weight <= 0.0:
+            continue
+        overlap = overlap_function(
+            float(state.global_intersection[class_index]),
+            float(state.global_predicted[class_index]),
+            float(state.global_target[class_index]),
+        )
+        value += weight * (0.0 if not np.isfinite(overlap) else overlap)
+    return float(value)
 
 
 def dice_batch_allclass_macro(state: "SegmentationMetricAccumulator") -> float:
@@ -248,6 +304,24 @@ def dice_global_fg(state: "SegmentationMetricAccumulator") -> float:
     return float(np.mean(valid)) if valid else float("nan")
 
 
+def dice_global_frequency_weighted_fg(
+    state: "SegmentationMetricAccumulator",
+) -> float:
+    """Dataset-global foreground Dice weighted by foreground GT pixel frequency."""
+    return _global_frequency_weighted_overlap(
+        state, _dice_or_nan, include_background=False
+    )
+
+
+def dice_global_frequency_weighted_all_class(
+    state: "SegmentationMetricAccumulator",
+) -> float:
+    """Dataset-global all-class Dice weighted by all-class GT pixel frequency."""
+    return _global_frequency_weighted_overlap(
+        state, _dice_or_nan, include_background=True
+    )
+
+
 DiceResult = float | dict[str, float]
 DiceFunction = Callable[["SegmentationMetricAccumulator"], DiceResult]
 DICE_METRIC_FUNCTIONS: dict[str, DiceFunction] = {
@@ -258,6 +332,139 @@ DICE_METRIC_FUNCTIONS: dict[str, DiceFunction] = {
     DICE_MACRO_FG_SCENE: dice_macro_fg_scene,
     DICE_CLASSWISE: dice_classwise,
     DICE_GLOBAL_FG: dice_global_fg,
+    DICE_GLOBAL_FREQUENCY_WEIGHTED_FG: dice_global_frequency_weighted_fg,
+    DICE_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS: (
+        dice_global_frequency_weighted_all_class
+    ),
+}
+
+
+def iou_batch_allclass_macro(state: "SegmentationMetricAccumulator") -> float:
+    """Historical sample-count-weighted mean of batch all-class macro IoU."""
+    if state.batch_sample_count <= 0:
+        return float("nan")
+    return float(state.batch_iou_sum / state.batch_sample_count)
+
+
+def iou_fg_binary_scene(state: "SegmentationMetricAccumulator") -> float:
+    """Mean scene-wise binary IoU after collapsing all foreground labels."""
+    values = [
+        _iou_or_nan(
+            scene.binary_intersection,
+            scene.binary_predicted,
+            scene.binary_target,
+        )
+        for scene in state.scene_counts.values()
+    ]
+    valid = [value for value in values if np.isfinite(value)]
+    return float(np.mean(valid)) if valid else float("nan")
+
+
+def iou_micro_fg_scene(state: "SegmentationMetricAccumulator") -> float:
+    """Mean scene-wise foreground micro IoU, preserving foreground classes."""
+    values = [
+        _iou_or_nan(
+            float(scene.intersection[1:].sum()),
+            float(scene.predicted[1:].sum()),
+            float(scene.target[1:].sum()),
+        )
+        for scene in state.scene_counts.values()
+    ]
+    valid = [value for value in values if np.isfinite(value)]
+    return float(np.mean(valid)) if valid else float("nan")
+
+
+def iou_weighted_fg_scene(state: "SegmentationMetricAccumulator") -> float:
+    """Mean scene-wise foreground IoU weighted by each class's GT area."""
+    scene_values: list[float] = []
+    for scene in state.scene_counts.values():
+        total_target = float(scene.target[1:].sum())
+        if total_target <= 0.0:
+            continue
+        value = 0.0
+        for class_index in range(1, state.num_classes):
+            weight = float(scene.target[class_index] / total_target)
+            if weight <= 0.0:
+                continue
+            class_iou = _iou_or_nan(
+                float(scene.intersection[class_index]),
+                float(scene.predicted[class_index]),
+                float(scene.target[class_index]),
+            )
+            value += weight * (0.0 if not np.isfinite(class_iou) else class_iou)
+        scene_values.append(value)
+    return float(np.mean(scene_values)) if scene_values else float("nan")
+
+
+def iou_macro_fg_scene(state: "SegmentationMetricAccumulator") -> float:
+    """Mean scene-wise macro IoU over non-empty foreground classes."""
+    scene_values: list[float] = []
+    for scene in state.scene_counts.values():
+        class_values = [
+            _iou_or_nan(
+                float(scene.intersection[class_index]),
+                float(scene.predicted[class_index]),
+                float(scene.target[class_index]),
+            )
+            for class_index in range(1, state.num_classes)
+        ]
+        valid = [value for value in class_values if np.isfinite(value)]
+        if valid:
+            scene_values.append(float(np.mean(valid)))
+    return float(np.mean(scene_values)) if scene_values else float("nan")
+
+
+def iou_classwise(state: "SegmentationMetricAccumulator") -> dict[str, float]:
+    """Dataset-global IoU for every class, including class 0 (background)."""
+    return {
+        f"class_{class_index}": _iou_or_nan(
+            float(state.global_intersection[class_index]),
+            float(state.global_predicted[class_index]),
+            float(state.global_target[class_index]),
+        )
+        for class_index in range(state.num_classes)
+    }
+
+
+def iou_global_fg(state: "SegmentationMetricAccumulator") -> float:
+    """Macro foreground IoU from dataset-global per-class pixel counts."""
+    class_values = list(iou_classwise(state).values())[1:]
+    valid = [value for value in class_values if np.isfinite(value)]
+    return float(np.mean(valid)) if valid else float("nan")
+
+
+def iou_global_frequency_weighted_fg(
+    state: "SegmentationMetricAccumulator",
+) -> float:
+    """Dataset-global foreground IoU weighted by foreground GT pixel frequency."""
+    return _global_frequency_weighted_overlap(
+        state, _iou_or_nan, include_background=False
+    )
+
+
+def iou_global_frequency_weighted_all_class(
+    state: "SegmentationMetricAccumulator",
+) -> float:
+    """Dataset-global all-class IoU weighted by all-class GT pixel frequency."""
+    return _global_frequency_weighted_overlap(
+        state, _iou_or_nan, include_background=True
+    )
+
+
+IoUResult = float | dict[str, float]
+IoUFunction = Callable[["SegmentationMetricAccumulator"], IoUResult]
+IOU_METRIC_FUNCTIONS: dict[str, IoUFunction] = {
+    IOU_BATCH_ALLCLASS_MACRO: iou_batch_allclass_macro,
+    IOU_FG_BINARY_SCENE: iou_fg_binary_scene,
+    IOU_MICRO_FG_SCENE: iou_micro_fg_scene,
+    IOU_WEIGHTED_FG_SCENE: iou_weighted_fg_scene,
+    IOU_MACRO_FG_SCENE: iou_macro_fg_scene,
+    IOU_CLASSWISE: iou_classwise,
+    IOU_GLOBAL_FG: iou_global_fg,
+    IOU_GLOBAL_FREQUENCY_WEIGHTED_FG: iou_global_frequency_weighted_fg,
+    IOU_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS: (
+        iou_global_frequency_weighted_all_class
+    ),
 }
 
 
@@ -454,10 +661,15 @@ class SegmentationMetricAccumulator:
         dice_results = {
             name: DICE_METRIC_FUNCTIONS[name](self) for name in self.metric_names
         }
+        iou_results = {
+            name: IOU_METRIC_FUNCTIONS[name](self) for name in IOU_METRIC_NAMES
+        }
         denominator = max(self.batch_sample_count, 1)
         return {
             "Dice": dice_results,
+            # Keep this historical scalar intact for old parsers/checkpoints.
             "IoU": float(self.batch_iou_sum / denominator),
+            "IoU_metrics": iou_results,
             "HD95": float(self.batch_hd95_sum / denominator),
         }
 

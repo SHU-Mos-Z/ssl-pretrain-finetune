@@ -17,6 +17,8 @@ from utils.datasets.conditioned_pretrain_dataset import (
 )
 from utils.datasets.homogeneous_batch_sampler import HomogeneousDistributedBatchSampler
 from utils.datasets.conditioned_finetune_dataset import (
+    ConditionedSlidingWindowSceneDataset,
+    ConditionedSlidingWindowTestDataset,
     build_conditioned_finetune_loaders,
 )
 from utils.datasets.conditioned_detection_dataset import (
@@ -135,6 +137,8 @@ __all__ = [
     "build_conditioned_pretrain_loader",
     "set_conditioned_dataset_epoch",
     "build_conditioned_finetune_loaders",
+    "ConditionedSlidingWindowSceneDataset",
+    "ConditionedSlidingWindowTestDataset",
     "ConditionedDetectionDataset",
     "DistributedEvalSampler",
     "build_conditioned_detection_loaders",

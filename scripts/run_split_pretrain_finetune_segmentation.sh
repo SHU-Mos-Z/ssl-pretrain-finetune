@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # ── 数据集 ────────────────────────────────────────────────────────────────────
-DATA_ROOT="${DATA_ROOT:-/home/zsq/processed_data/DFS3R-main/data/TMA_patch_1024x1024_overlap_0x0_to_256x256_minmax/}"
+DATA_ROOT="${DATA_ROOT:-/home/zsq/processed_data/DFS3R-main/data/GPCC_Resized_512_640_to_256_256_overlap_0_0_preprocessed/}"
 
 # ── NMF 缓存键：须与离线 NMF 完全一致 ───────────────────────────────────────
 K="${K:-16}"

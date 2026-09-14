@@ -10,14 +10,14 @@ cd "$PROJECT_ROOT"
 
 # These values are exported once so every child experiment uses the same
 # hardware, effective batch size, learning rate, checkpoint, and fixed splits.
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,7}"
 export NUM_GPUS="${NUM_GPUS:-2}"
 export BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-4}"
 export LR="${LR:-4e-4}"
 export PRETRAIN_CKPT="${PRETRAIN_CKPT:-records/pretrain_conditioned/20260817_005610/ckpt_last.pth}"
-export TRAIN_ROOT="${TRAIN_ROOT:-data/GPCC_Resized_512_640_to_256_256_overlap_0_0_preprocessed_finetune_train_p070_20260728}"
-export VAL_ROOT="${VAL_ROOT:-data/GPCC_Resized_512_640_to_256_256_overlap_0_0_preprocessed_finetune_val_p015_20260728}"
-export TEST_ROOT="${TEST_ROOT:-data/GPCC_Resized_512_640_to_256_256_overlap_0_0_preprocessed_finetune_test_p015_20260728}"
+export TRAIN_ROOT="${TRAIN_ROOT:-data/GPCC_Resized_512_640_to_256_256_overlap_0_0_preprocessed_finetune_train_p070_20260913}"
+export VAL_ROOT="${VAL_ROOT:-data/GPCC_Resized_512_640_to_256_256_overlap_0_0_preprocessed_finetune_val_p015_20260913}"
+export TEST_ROOT="${TEST_ROOT:-data/GPCC_Resized_512_640_to_256_256_overlap_0_0_preprocessed_finetune_test_p015_20260913}"
 
 # Data-pipeline controls; these do not alter model or optimization semantics.
 export WORKERS="${WORKERS:-2}"

@@ -14,6 +14,7 @@ from models.conditioned_contracts import ConditionedModelConfig
 from models.finetune_model_conditioned import ConditionedFinetuneModel
 from utils.datasets import build_conditioned_finetune_loaders
 from utils.datasets.conditioned_finetune_dataset import (
+    ConditionedSlidingWindowSceneDataset,
     ConditionedSlidingWindowTestDataset,
     collate_conditioned_model_inputs,
 )
@@ -25,6 +26,9 @@ from utils.losses import build_segmentation_criterion, primary_segmentation_logi
 from utils.metrics import (
     DICE_BATCH_ALLCLASS_MACRO,
     DICE_CLASSWISE,
+    DICE_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS,
+    DICE_GLOBAL_FREQUENCY_WEIGHTED_FG,
+    IOU_METRIC_NAMES,
     SegmentationMetricAccumulator,
     normalize_dice_metric_names,
 )
@@ -37,6 +41,15 @@ def get_args():
     )
     p.add_argument("--train-root", required=True)
     p.add_argument("--val-root", required=True)
+    p.add_argument(
+        "--scene-val-root",
+        default=None,
+        help=(
+            "Optional directory of complete validation scenes. When set, sliding-window "
+            "scene validation is used for best/window checkpoint selection while "
+            "--val-root remains the inexpensive patch-validation source."
+        ),
+    )
     p.add_argument("--test-root")
     p.add_argument("--wavelength-file", default=None)
     p.add_argument("--allow-index-wavelengths", action="store_true")
@@ -211,6 +224,20 @@ def get_args():
         help="Debug/smoke-test limit for each validation/test pass; <=0 uses all batches.",
     )
     p.add_argument(
+        "--scene-val-interval",
+        type=int,
+        default=5,
+        help="Run optional complete-scene validation every N epochs; <=0 is invalid when enabled.",
+    )
+    p.add_argument("--scene-val-window-size", type=int, default=224)
+    p.add_argument("--scene-val-window-stride", type=int, default=112)
+    p.add_argument("--scene-val-window-batch-size", type=int, default=4)
+    p.add_argument(
+        "--scene-val-window-blend",
+        choices=["uniform", "gaussian"],
+        default="gaussian",
+    )
+    p.add_argument(
         "--test-inference-mode",
         choices=["direct", "sliding_window"],
         default="direct",
@@ -290,7 +317,7 @@ def _sliding_blend_weight(window_size: int, mode: str) -> torch.Tensor:
 @torch.no_grad()
 def evaluate_sliding_window(
     model,
-    dataset: ConditionedSlidingWindowTestDataset,
+    dataset: ConditionedSlidingWindowSceneDataset,
     num_classes: int,
     device,
     *,
@@ -304,6 +331,7 @@ def evaluate_sliding_window(
     max_scenes: int = 0,
     progress: str = "log",
     log_interval: int = 10,
+    phase_label: str = "Sliding evaluation",
 ):
     """Predict complete scenes by blending continuous window logits.
 
@@ -320,7 +348,7 @@ def evaluate_sliding_window(
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
     iterable = indices
     if progress == "tqdm" and rank == 0:
-        iterable = tqdm(indices, desc="Test sliding scenes", leave=False)
+        iterable = tqdm(indices, desc=phase_label, leave=False)
     blend_weight = _sliding_blend_weight(window_size, blend)
 
     for local_scene_index, dataset_index in enumerate(iterable):
@@ -388,7 +416,7 @@ def evaluate_sliding_window(
                  or local_scene_index + 1 == len(indices))
         ):
             print(
-                f"[Test sliding] scenes={local_scene_index + 1}/{len(indices)} "
+                f"[{phase_label}] scenes={local_scene_index + 1}/{len(indices)} "
                 f"stem={scene['stem']} windows={len(coordinates)}",
                 flush=True,
             )
@@ -426,6 +454,7 @@ def evaluate_test(model, test_source, num_classes, device, args, dice_metrics):
         max_scenes=args.max_eval_batches,
         progress=args.progress,
         log_interval=args.log_interval,
+        phase_label="Test sliding",
     )
 
 
@@ -450,6 +479,31 @@ def _flatten_dice_history(metrics: dict, prefix: str) -> dict[str, float]:
 def _format_dice(metrics: dict) -> str:
     fields: list[str] = []
     for name, value in metrics["Dice"].items():
+        if isinstance(value, dict):
+            class_text = ", ".join(
+                f"{class_name}={class_value:.4f}"
+                for class_name, class_value in value.items()
+            )
+            fields.append(f"{name}[{class_text}]")
+        else:
+            fields.append(f"{name}={value:.4f}")
+    return " | ".join(fields)
+
+
+def _flatten_iou_history(metrics: dict, prefix: str) -> dict[str, float]:
+    flattened: dict[str, float] = {}
+    for name, value in metrics["IoU_metrics"].items():
+        if isinstance(value, dict):
+            for class_name, class_value in value.items():
+                flattened[f"{prefix}_iou_{class_name}"] = float(class_value)
+        else:
+            flattened[f"{prefix}_iou_{name}"] = float(value)
+    return flattened
+
+
+def _format_iou(metrics: dict) -> str:
+    fields: list[str] = []
+    for name, value in metrics["IoU_metrics"].items():
         if isinstance(value, dict):
             class_text = ", ".join(
                 f"{class_name}={class_value:.4f}"
@@ -553,6 +607,25 @@ def main():
     if a.endmember_scope == "scene" and not a.scene_endmember_root:
         raise ValueError("scene endmember scope requires --scene-endmember-root")
     aspp_rates = _parse_positive_int_tuple(a.aspp_rates, "--aspp-rates")
+    if a.scene_val_root:
+        if a.scene_val_interval <= 0:
+            raise ValueError("--scene-val-interval must be positive when --scene-val-root is set")
+        if a.scene_val_window_size <= 0:
+            raise ValueError("--scene-val-window-size must be positive")
+        if (
+            a.scene_val_window_stride <= 0
+            or a.scene_val_window_stride > a.scene_val_window_size
+        ):
+            raise ValueError(
+                "--scene-val-window-stride must be positive and no larger than window size"
+            )
+        if a.scene_val_window_batch_size <= 0:
+            raise ValueError("--scene-val-window-batch-size must be positive")
+        if a.scene_val_window_size % a.patch_size:
+            raise ValueError(
+                f"scene validation window size {a.scene_val_window_size} must be "
+                f"divisible by model spatial patch size {a.patch_size}"
+            )
     if a.test_inference_mode == "sliding_window":
         if a.test_window_size <= 0:
             raise ValueError("--test-window-size must be positive")
@@ -579,6 +652,15 @@ def main():
         primary_dice_metric = DICE_BATCH_ALLCLASS_MACRO
     if primary_dice_metric not in dice_metric_names:
         dice_metric_names.append(primary_dice_metric)
+    # Always report the two dataset-global frequency-weighted protocols.  They
+    # are supplementary only: the configured primary metric and checkpoint
+    # selection semantics remain unchanged.
+    for supplementary_metric in (
+        DICE_GLOBAL_FREQUENCY_WEIGHTED_FG,
+        DICE_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS,
+    ):
+        if supplementary_metric not in dice_metric_names:
+            dice_metric_names.append(supplementary_metric)
     dice_metric_names_tuple = tuple(dice_metric_names)
     dist.init_process_group("nccl")
     rank = dist.get_rank()
@@ -602,6 +684,11 @@ def main():
             flush=True,
         )
         print(
+            f"[Finetune] IoU metrics: {', '.join(IOU_METRIC_NAMES)}; "
+            "legacy IoU=batch_allclass_macro",
+            flush=True,
+        )
+        print(
             f"[Finetune] DataLoader: workers/rank={a.workers}, "
             f"persistent={a.persistent_workers and a.workers > 0}, "
             f"prefetch_factor={a.prefetch_factor if a.workers > 0 else 'n/a'}, "
@@ -616,6 +703,16 @@ def main():
             )
             print(
                 f"[Finetune] Test inference: {a.test_inference_mode}{sliding_details}",
+                flush=True,
+            )
+        if a.scene_val_root:
+            print(
+                "[Finetune] Full-scene validation: "
+                f"root={a.scene_val_root}, interval={a.scene_val_interval}, "
+                f"window={a.scene_val_window_size}, "
+                f"stride={a.scene_val_window_stride}, "
+                f"tile_batch={a.scene_val_window_batch_size}, "
+                f"blend={a.scene_val_window_blend}; checkpoint selector=scene",
                 flush=True,
             )
     data_kwargs = dict(
@@ -644,7 +741,7 @@ def main():
         endmember_scope=a.endmember_scope,
         scene_endmember_root=a.scene_endmember_root,
     )
-    train, val, test, sampler = build_conditioned_finetune_loaders(
+    loader_result = build_conditioned_finetune_loaders(
         a.train_root,
         a.val_root,
         a.test_root,
@@ -652,12 +749,18 @@ def main():
         a.workers,
         True,
         test_inference_mode=a.test_inference_mode,
+        scene_val_root=a.scene_val_root,
         persistent_workers=a.persistent_workers,
         prefetch_factor=a.prefetch_factor,
         distributed_validation=a.distributed_validation,
         validation_max_batches=a.max_eval_batches,
         **data_kwargs,
     )
+    if a.scene_val_root:
+        train, val, scene_val, test, sampler = loader_result
+    else:
+        train, val, test, sampler = loader_result
+        scene_val = None
     cfg = ConditionedModelConfig(
         patch_size=a.patch_size,
         spectral_patch_size=a.spectral_patch_size,
@@ -724,6 +827,7 @@ def main():
                 flush=True,
             )
             print(f"[Eval-only] Test Dice: {_format_dice(test_metrics)}", flush=True)
+            print(f"[Eval-only] Test IoU: {_format_iou(test_metrics)}", flush=True)
             with open(
                 os.path.join(a.save_dir, "eval_only_metrics.json"),
                 "w",
@@ -733,6 +837,8 @@ def main():
                     {
                         "checkpoint": a.eval_only_checkpoint,
                         "primary_dice_metric": primary_dice_metric,
+                        "dice_metrics": list(dice_metric_names_tuple),
+                        "iou_metrics": list(IOU_METRIC_NAMES),
                         "test_inference": {
                             "mode": a.test_inference_mode,
                             "window_size": a.test_window_size,
@@ -784,13 +890,20 @@ def main():
     # 异常，在下一个 step 精确地暴露出来。bf16 动态范围更大，无需损失缩放，
     # 从而去掉了这个高频陷阱。
     best_dice = 0.0
+    best_patch_dice = 0.0
     no_improve = 0
     best_path = os.path.join(a.save_dir, "ckpt_best.pth")
+    best_patch_path = os.path.join(a.save_dir, "ckpt_best_patch.pth")
+    best_scene_path = os.path.join(a.save_dir, "ckpt_best_scene.pth")
     latest_path = os.path.join(a.save_dir, "ckpt_last.pth")
     curve_monitor = (
         FinetuneCurveMonitor(
             a.save_dir,
-            build_segmentation_curve_groups(dice_metric_names_tuple, a.num_classes),
+            build_segmentation_curve_groups(
+                dice_metric_names_tuple,
+                a.num_classes,
+                iou_metric_names=IOU_METRIC_NAMES,
+            ),
         )
         if rank == 0
         else None
@@ -868,6 +981,29 @@ def main():
         dice = _scalar_dice(val_metrics, primary_dice_metric)
         iou = float(val_metrics["IoU"])
         hd = float(val_metrics["HD95"])
+        run_scene_val = bool(
+            scene_val is not None
+            and (epoch % a.scene_val_interval == 0 or epoch == a.epochs)
+        )
+        scene_val_metrics = None
+        if run_scene_val:
+            scene_val_metrics = evaluate_sliding_window(
+                model,
+                scene_val,
+                a.num_classes,
+                local,
+                window_size=a.scene_val_window_size,
+                stride=a.scene_val_window_stride,
+                tile_batch_size=a.scene_val_window_batch_size,
+                blend=a.scene_val_window_blend,
+                amp=a.amp,
+                hd95_backend=a.hd95_backend,
+                dice_metrics=dice_metric_names_tuple,
+                max_scenes=a.max_eval_batches,
+                progress=a.progress,
+                log_interval=a.log_interval,
+                phase_label="Scene val sliding",
+            )
         stop = torch.zeros(1, dtype=torch.int32, device=local)
         if rank == 0:
             current_lr = optimizer.param_groups[0]["lr"]
@@ -882,6 +1018,22 @@ def main():
                 "learning_rate": current_lr,
             }
             history_values.update(_flatten_dice_history(val_metrics, "val"))
+            history_values.update(_flatten_iou_history(val_metrics, "val"))
+            if scene_val_metrics is not None:
+                scene_dice = _scalar_dice(scene_val_metrics, primary_dice_metric)
+                history_values.update(
+                    {
+                        "val_scene_dice_primary": scene_dice,
+                        "val_scene_iou": float(scene_val_metrics["IoU"]),
+                        "val_scene_hd95": float(scene_val_metrics["HD95"]),
+                    }
+                )
+                history_values.update(
+                    _flatten_dice_history(scene_val_metrics, "val_scene")
+                )
+                history_values.update(
+                    _flatten_iou_history(scene_val_metrics, "val_scene")
+                )
             curve_monitor.record(epoch, history_values)
             print(
                 f'[{time.strftime("%F %T")}] Epoch {epoch}/{a.epochs} '
@@ -892,23 +1044,55 @@ def main():
                 flush=True,
             )
             print(f"[Val Dice] {_format_dice(val_metrics)}", flush=True)
-            state = (model.module if isinstance(model, DDP) else model).state_dict()
-            torch.save(state, latest_path)
-            if dice > best_dice:
-                best_dice = dice
-                no_improve = 0
-                torch.save(state, best_path)
+            print(f"[Val IoU] {_format_iou(val_metrics)}", flush=True)
+            if scene_val_metrics is not None:
                 print(
-                    f">>> New Best Model Saved! {primary_dice_metric}: "
-                    f"{best_dice:.4f}",
+                    f"[Scene Val] primary Dice ({primary_dice_metric}): "
+                    f"{scene_dice:.4f} | IoU: {scene_val_metrics['IoU']:.4f} | "
+                    f"HD95: {scene_val_metrics['HD95']:.4f}",
                     flush=True,
                 )
+                print(
+                    f"[Scene Val Dice] {_format_dice(scene_val_metrics)}", flush=True
+                )
+                print(
+                    f"[Scene Val IoU] {_format_iou(scene_val_metrics)}", flush=True
+                )
+            state = (model.module if isinstance(model, DDP) else model).state_dict()
+            torch.save(state, latest_path)
+            if scene_val is not None:
+                if dice > best_patch_dice:
+                    best_patch_dice = dice
+                    torch.save(state, best_patch_path)
+                    print(
+                        f">>> New Best Patch-Val Model Saved! {primary_dice_metric}: "
+                        f"{best_patch_dice:.4f}",
+                        flush=True,
+                    )
+                selector_dice = scene_dice if scene_val_metrics is not None else None
             else:
-                no_improve += 1
-                if a.early_stop:
+                selector_dice = dice
+            selector_improved = False
+            if selector_dice is not None:
+                if selector_dice > best_dice:
+                    selector_improved = True
+                    best_dice = selector_dice
+                    no_improve = 0
+                    torch.save(state, best_path)
+                    if scene_val is not None:
+                        torch.save(state, best_scene_path)
+                    print(
+                        f">>> New Best {'Scene-Val ' if scene_val is not None else ''}"
+                        f"Model Saved! {primary_dice_metric}: {best_dice:.4f}",
+                        flush=True,
+                    )
+                else:
+                    no_improve += 1
+            if a.early_stop and selector_dice is not None:
+                if not selector_improved:
                     print(
                         f"[EarlyStop] No improvement for {no_improve}/{a.patience} "
-                        f"epochs. Best {primary_dice_metric}: {best_dice:.4f}",
+                        f"validation checks. Best {primary_dice_metric}: {best_dice:.4f}",
                         flush=True,
                     )
             if epoch % a.save_interval == 0:
@@ -920,15 +1104,23 @@ def main():
                 window_start = window_idx * a.best_val_interval + 1
                 window_end = window_start + a.best_val_interval - 1
                 window_key = f"{window_start:04d}-{window_end:04d}"
-                if dice > window_best_dice.get(window_key, -1.0):
-                    window_best_dice[window_key] = dice
+                window_selector_dice = (
+                    scene_dice if scene_val_metrics is not None
+                    else dice if scene_val is None
+                    else None
+                )
+                if (
+                    window_selector_dice is not None
+                    and window_selector_dice > window_best_dice.get(window_key, -1.0)
+                ):
+                    window_best_dice[window_key] = window_selector_dice
                     window_path = os.path.join(
                         a.save_dir, f"ckpt_window{window_key}_best.pth"
                     )
                     torch.save(state, window_path)
                     print(
                         f">>> [Window {window_key}] New best {primary_dice_metric}: "
-                        f"{dice:.4f} "
+                        f"{window_selector_dice:.4f} "
                         f"at epoch {epoch}",
                         flush=True,
                     )
@@ -984,6 +1176,10 @@ def main():
                         f"[{label}] Test Dice: {_format_dice(test_metrics)}",
                         flush=True,
                     )
+                    print(
+                        f"[{label}] Test IoU: {_format_iou(test_metrics)}",
+                        flush=True,
+                    )
 
         best_test_metrics = _load_and_test(best_path)
         test_results["ckpt_best"] = best_test_metrics
@@ -996,6 +1192,7 @@ def main():
                 flush=True,
             )
             print(f"Test Dice: {_format_dice(best_test_metrics)}", flush=True)
+            print(f"Test IoU: {_format_iou(best_test_metrics)}", flush=True)
             with open(
                 os.path.join(a.save_dir, "test_metrics.json"),
                 "w",
@@ -1005,6 +1202,24 @@ def main():
                     {
                         "primary_dice_metric": primary_dice_metric,
                         "dice_metrics": list(dice_metric_names_tuple),
+                        "iou_metrics": list(IOU_METRIC_NAMES),
+                        "checkpoint_selection": (
+                            "complete_scene_validation"
+                            if scene_val is not None
+                            else "patch_validation"
+                        ),
+                        "scene_validation": (
+                            {
+                                "root": a.scene_val_root,
+                                "interval": a.scene_val_interval,
+                                "window_size": a.scene_val_window_size,
+                                "window_stride": a.scene_val_window_stride,
+                                "window_batch_size": a.scene_val_window_batch_size,
+                                "blend": a.scene_val_window_blend,
+                            }
+                            if scene_val is not None
+                            else None
+                        ),
                         "test_inference": {
                             "mode": a.test_inference_mode,
                             "window_size": a.test_window_size,

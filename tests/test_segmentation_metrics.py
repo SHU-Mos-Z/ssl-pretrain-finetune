@@ -8,8 +8,15 @@ import torch
 from utils.metrics import (
     DICE_BATCH_ALLCLASS_MACRO,
     DICE_CLASSWISE,
+    DICE_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS,
+    DICE_GLOBAL_FREQUENCY_WEIGHTED_FG,
     DICE_GLOBAL_FG,
     DICE_METRIC_NAMES,
+    IOU_BATCH_ALLCLASS_MACRO,
+    IOU_CLASSWISE,
+    IOU_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS,
+    IOU_GLOBAL_FREQUENCY_WEIGHTED_FG,
+    IOU_METRIC_NAMES,
     SegmentationMetricAccumulator,
     compute_segmentation_metrics,
     infer_segmentation_scene_id,
@@ -71,7 +78,7 @@ def test_metric_name_selection_ignores_invalid_and_falls_back() -> None:
     assert normalize_dice_metric_names([]) == (DICE_BATCH_ALLCLASS_MACRO,)
 
 
-def test_all_seven_metrics_are_returned_with_classwise_mapping() -> None:
+def test_all_overlap_metrics_are_returned_with_classwise_mapping() -> None:
     target = torch.tensor([[[0, 1], [2, 0]]], dtype=torch.long)
     logits = _labels_to_logits(target.clone(), num_classes=3)
     metrics = compute_segmentation_metrics(
@@ -88,11 +95,27 @@ def test_all_seven_metrics_are_returned_with_classwise_mapping() -> None:
         "class_1",
         "class_2",
     }
+    assert tuple(metrics["IoU_metrics"]) == IOU_METRIC_NAMES
+    assert set(metrics["IoU_metrics"][IOU_CLASSWISE]) == {
+        "class_0",
+        "class_1",
+        "class_2",
+    }
+    assert metrics["IoU"] == pytest.approx(
+        metrics["IoU_metrics"][IOU_BATCH_ALLCLASS_MACRO]
+    )
     for name, value in metrics["Dice"].items():
         if isinstance(value, dict):
             assert all(item == pytest.approx(1.0) for item in value.values())
         elif name == DICE_BATCH_ALLCLASS_MACRO:
             # Historical implementation adds epsilon only to the denominator.
+            assert value == pytest.approx(1.0, abs=1e-5)
+        else:
+            assert value == pytest.approx(1.0)
+    for name, value in metrics["IoU_metrics"].items():
+        if isinstance(value, dict):
+            assert all(item == pytest.approx(1.0) for item in value.values())
+        elif name == IOU_BATCH_ALLCLASS_MACRO:
             assert value == pytest.approx(1.0, abs=1e-5)
         else:
             assert value == pytest.approx(1.0)
@@ -131,6 +154,40 @@ def test_global_and_scene_metrics_are_batch_partition_invariant() -> None:
             assert split_metrics[name] == pytest.approx(whole_metrics[name])
         else:
             assert split_metrics[name] == pytest.approx(whole_metrics[name])
+
+    whole_iou = whole.compute()["IoU_metrics"]
+    split_iou = split.compute()["IoU_metrics"]
+    for name in IOU_METRIC_NAMES:
+        if name == IOU_BATCH_ALLCLASS_MACRO:
+            continue
+        assert split_iou[name] == pytest.approx(whole_iou[name])
+
+
+def test_global_frequency_weighted_dice_and_iou_use_gt_pixel_frequency() -> None:
+    target = torch.tensor(
+        [[[0, 0, 0, 1], [1, 2, 2, 2]]], dtype=torch.long
+    )
+    pred = torch.tensor(
+        [[[0, 0, 1, 1], [1, 2, 0, 2]]], dtype=torch.long
+    )
+    metrics = compute_segmentation_metrics(
+        _labels_to_logits(pred, num_classes=3),
+        target,
+        num_classes=3,
+        dice_metrics=list(DICE_METRIC_NAMES),
+        scene_ids=["scene-a"],
+    )
+
+    assert metrics["Dice"][DICE_GLOBAL_FREQUENCY_WEIGHTED_FG] == pytest.approx(0.8)
+    assert metrics["Dice"][DICE_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS] == pytest.approx(
+        0.75
+    )
+    assert metrics["IoU_metrics"][IOU_GLOBAL_FREQUENCY_WEIGHTED_FG] == pytest.approx(
+        2.0 / 3.0
+    )
+    assert metrics["IoU_metrics"][
+        IOU_GLOBAL_FREQUENCY_WEIGHTED_ALL_CLASS
+    ] == pytest.approx(29.0 / 48.0)
 
 
 def test_scene_id_inference_covers_current_dataset_suffixes() -> None:

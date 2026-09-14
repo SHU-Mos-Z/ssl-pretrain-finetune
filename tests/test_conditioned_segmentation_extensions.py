@@ -8,6 +8,11 @@ from models.modules_conditioned.segmentation_heads import build_segmentation_hea
 from utils.augmentations.segmentation_spatial import augment_hsi_segmentation_pair
 from utils.losses import build_segmentation_criterion, primary_segmentation_logits
 from utils.losses.soft_dice_ce_loss import SoftDiceCrossEntropyLoss
+from utils.datasets.conditioned_finetune_dataset import (
+    ConditionedSlidingWindowSceneDataset,
+    build_conditioned_finetune_loaders,
+)
+from utils.preprocessing.offline_nmf import cache_dir_name
 
 
 def test_historical_head_and_loss_are_exactly_preserved() -> None:
@@ -86,3 +91,63 @@ def test_dihedral_augmentation_keeps_hsi_and_mask_aligned() -> None:
     recovered = np.rint(result.intensity[0] * 5.0 - 1.0).astype(np.int64)
     np.testing.assert_array_equal(recovered, result.mask)
     assert set(np.unique(result.mask)).issubset({0, 1, 2, 3})
+
+
+def test_optional_complete_scene_validation_preserves_legacy_loader_path(tmp_path) -> None:
+    cache_name = cache_dir_name(2, 5e-4, 2e-4, 1e-2, True, 0.05, 3.0)
+    for split, shape in (
+        ("train", (16, 16, 5)),
+        ("val", (16, 16, 5)),
+        ("val_scenes", (80, 84, 5)),
+        ("test", (80, 84, 5)),
+    ):
+        root = tmp_path / split
+        (root / "images").mkdir(parents=True)
+        (root / "masks").mkdir()
+        (root / cache_name).mkdir()
+        np.save(root / "wavelengths.npy", np.arange(5, dtype=np.float32))
+        np.save(
+            root / "images" / "subject-1.npy",
+            np.full(shape, 0.5, dtype=np.float32),
+        )
+        np.save(
+            root / "masks" / "subject-1.npy",
+            np.zeros(shape[:2], dtype=np.uint8),
+        )
+        np.save(
+            root / cache_name / "subject-1_E.npy",
+            np.ones((2, 5), dtype=np.float32),
+        )
+
+    shared = dict(
+        batch_size=1,
+        num_workers=0,
+        patch_size=4,
+        spectral_patch_size=5,
+        nmf_k=2,
+        nmf_simplex=True,
+        nmf_e_clamp_max=3.0,
+    )
+    train, val, scene_val, test, sampler = build_conditioned_finetune_loaders(
+        str(tmp_path / "train"),
+        str(tmp_path / "val"),
+        str(tmp_path / "test"),
+        test_inference_mode="sliding_window",
+        scene_val_root=str(tmp_path / "val_scenes"),
+        **shared,
+    )
+    assert len(train.dataset) == 1
+    assert len(val.dataset) == 1
+    assert isinstance(scene_val, ConditionedSlidingWindowSceneDataset)
+    assert isinstance(test, ConditionedSlidingWindowSceneDataset)
+    assert sampler is None
+
+    legacy_result = build_conditioned_finetune_loaders(
+        str(tmp_path / "train"),
+        str(tmp_path / "val"),
+        None,
+        **shared,
+    )
+    assert len(legacy_result) == 4
+    _, _, legacy_test, _ = legacy_result
+    assert legacy_test is None
